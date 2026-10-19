@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import top.cenmin.tailcontrol.R
 import top.cenmin.tailcontrol.share.FileShareActivity
+import top.cenmin.tailcontrol.share.UploadSessions
 
 class FileTransferService : Service() {
     companion object {
@@ -49,32 +50,33 @@ class FileTransferService : Service() {
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
                 val canPost = Build.VERSION.SDK_INT < 33 ||
                     checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-
-                // Foreground service startup is required even when notification permission is denied.
                 if (!isForegroundStarted) {
-                    startForeground(NOTIFICATION_ID, builder.build())
-                    isForegroundStarted = true
+                    try {
+                        startForeground(NOTIFICATION_ID, builder.build())
+                        isForegroundStarted = true
+                    } catch (e: Exception) {
+                        UploadSessions.cancelForTimeout()
+                        stopSelf()
+                        return START_NOT_STICKY
+                    }
                 } else if (canPost) {
                     NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, builder.build())
                 }
-                if (progress >= 100) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                }
+                if (progress >= 100) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
             }
-            ACTION_STOP -> {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            }
+            ACTION_STOP -> { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
         }
-        // The ViewModel owns the transfer; do not resurrect an orphaned notification.
         return START_NOT_STICKY
     }
 
-    override fun onDestroy() {
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        // Both dataSync services share the system budget. Cancel only our registered upload jobs.
+        UploadSessions.cancelForTimeout()
         stopForeground(STOP_FOREGROUND_REMOVE)
-        super.onDestroy()
+        stopSelf()
     }
+
+    override fun onDestroy() { stopForeground(STOP_FOREGROUND_REMOVE); super.onDestroy() }
 
     private fun createNotificationChannel() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager

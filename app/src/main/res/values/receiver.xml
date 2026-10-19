@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="receiver_attention">Receiving paused: %1$s. Open the app to review.</string>
+    <string name="receiver_unconfirmed">Receiver state cannot be confirmed: %1$s. No second receiver will be started.</string>
+    <string name="receiver_timed_out">Android ended the receiving session. The root receiver is being stopped; reopen the app to resume. This is not an unlimited background daemon.</string>
+    <string name="receiver_resume_failed">The receiver owner changed or is still active. Refresh its status before resuming.</string>
+    <string name="receiver_open_app_to_resume">Receiving needs review. Open TailControl and confirm recovery there.</string>
+    <string name="receiver_cleanup_incomplete">Some receiver identities changed or have not exited. No unrelated process was killed. Check the log and refresh.</string>
+    <string name="receiver_resume_title">Review before resuming</string>
+    <string name="receiver_resume_warning">The previous batch failed or was interrupted. A file may already have been written while its inbox entry remains. Check the receive directory, inbox and log first. Resuming can create another copy. No file will be deleted or deduplicated automatically. With the skip policy, a name conflict also pauses receiving until reviewed.</string>
+    <string name="receiver_resume_confirm">Reviewed, resume</string>
+    <string name="receiver_legacy_title">Inspect old receive loops</string>
+    <string name="receiver_no_legacy">No matching legacy default-socket receive loops were found. One-shot receives, uploads, Ping and login tasks are not selected.</string>
+    <string name="receiver_legacy_warning">Stop the old or manually started module receive loops with these PIDs: %1$s? Their boot ID, start time, UID, executable and arguments will be checked again. Files will not be deleted. Uploads, Ping and login tasks are not selected.</string>
+    <string name="receiver_state_text">Root receiver: %1$s · %2$s</string>
+    <string name="receiver_session_limits">Errors pause automatic receiving for review. Android 15+ limits background data-sync sessions and does not restore them automatically at boot.</string>
+    <string name="receiver_boot_paused">Android 15+ does not allow this data-sync session to restart at boot. Open TailControl to start receiving.</string>
+</resources>

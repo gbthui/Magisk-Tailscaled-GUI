@@ -12,14 +12,15 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import top.cenmin.tailcontrol.R
 import top.cenmin.tailcontrol.core.data.TailscaleRepository
 import top.cenmin.tailcontrol.core.model.BackendState
@@ -79,10 +80,7 @@ class FileShareViewModel @Inject constructor(
         refreshJob = viewModelScope.launch {
             while (isActive) {
                 refreshOnce()
-                for (i in 5 downTo 1) {
-                    _ui.update { it.copy(countdown = i) }
-                    delay(1000)
-                }
+                for (i in 5 downTo 1) { _ui.update { it.copy(countdown = i) }; delay(1000) }
             }
         }
     }
@@ -90,17 +88,11 @@ class FileShareViewModel @Inject constructor(
     fun refreshOnce() {
         viewModelScope.launch(Dispatchers.IO) {
             val status = tailRepo.fetchStatus()
-            _ui.update { current ->
-                current.copy(
-                    tailscaleState = status.backendState,
-                    peers = status.peers,
-                    showNotRunningDialog = status.backendState !is BackendState.Running,
-                    showOfflineDialog = status.backendState is BackendState.Running && status.self?.online != true,
-                )
-            }
+            _ui.update { it.copy(tailscaleState = status.backendState, peers = status.peers,
+                showNotRunningDialog = status.backendState !is BackendState.Running,
+                showOfflineDialog = status.backendState is BackendState.Running && status.self?.online != true) }
         }
     }
-
     fun startTailscale() {
         viewModelScope.launch(Dispatchers.IO) {
             val result = tailRepo.up()
@@ -108,11 +100,9 @@ class FileShareViewModel @Inject constructor(
             refreshOnce()
         }
     }
-
     fun dismissNotRunning() { _ui.update { it.copy(showNotRunningDialog = false) } }
     fun dismissOffline() { _ui.update { it.copy(showOfflineDialog = false) } }
 
-    /** Known, unknown, and zero-byte files all use the same command and IO lifecycle. */
     fun send(peer: TailscaleDevice) {
         if (_ui.value.transferring || transferJob?.isActive == true) return
         val current = _ui.value
@@ -122,29 +112,23 @@ class FileShareViewModel @Inject constructor(
         val initialText = progressText(0, initial)
         _ui.update { it.copy(transferring = true, transferFinished = false,
             progressPercent = initial, progressText = initialText) }
-
         transferJob = viewModelScope.launch(Dispatchers.IO) {
+            val sessionJob = currentCoroutineContext().job
+            UploadSessions.register(sessionJob)
             try {
                 pushNotification(initial, initialText)
                 val target = peer.ipv4 ?: peer.ipv6?.let { "[$it]" }
                     ?: peer.dnsName.trimEnd('.').ifBlank { peer.name }
                 val command = ShellCommand.fileSend(current.fileName, target)
-                val input = app.contentResolver.openInputStream(uri)
-                    ?: throw IOException("Cannot open the shared file")
-                val process = try {
-                    shell.startProcess(*command)
-                } catch (e: Exception) {
-                    input.close()
-                    throw e
-                }
+                val input = app.contentResolver.openInputStream(uri) ?: throw IOException("Cannot open the shared file")
+                val process = try { shell.startProcess(*command) } catch (e: Exception) { input.close(); throw e }
                 var lastUpdate = 0L
                 var lastPercent = initial
                 val result = ProcessIo.transfer(process, input, total) { bytes ->
                     val percent = TransferProgress.percent(bytes, total)
                     val now = System.nanoTime()
                     if (percent != lastPercent || now - lastUpdate >= 250_000_000L) {
-                        lastUpdate = now
-                        lastPercent = percent
+                        lastUpdate = now; lastPercent = percent
                         val text = progressText(bytes, percent)
                         _ui.update { it.copy(progressPercent = percent, progressText = text) }
                         pushNotification(percent, text)
@@ -155,11 +139,11 @@ class FileShareViewModel @Inject constructor(
                     progressText = app.getString(R.string.transfer_complete_progress)) }
                 pushNotification(100, app.getString(R.string.transfer_complete))
             } catch (e: CancellationException) {
+                showFailure(e.message ?: app.getString(R.string.transfer_canceled))
                 throw e
-            } catch (e: Exception) {
-                showFailure(e.message ?: "Unable to transfer file")
-            } finally {
-                // ProcessIo owns process/pipe cleanup, including cancellation and producer failures.
+            } catch (e: Exception) { showFailure(e.message ?: "Unable to transfer file") }
+            finally {
+                UploadSessions.unregister(sessionJob)
                 if (_ui.value.progressPercent != 100) stopNotification()
             }
         }
@@ -168,49 +152,31 @@ class FileShareViewModel @Inject constructor(
     private fun progressText(bytes: Long, percent: Int): String = if (percent < 0) {
         app.getString(R.string.taildrop_processed_bytes, Formatter.formatShortFileSize(app, bytes))
     } else "$percent%"
-
     private fun showFailure(message: String) {
         _ui.update { it.copy(transferring = false, transferFinished = true,
             progressText = app.getString(R.string.transfer_failed, message)) }
     }
-
     fun openCancelDialog() { _ui.update { it.copy(cancelDialogOpen = true) } }
     fun dismissCancelDialog() { _ui.update { it.copy(cancelDialogOpen = false) } }
-
     fun confirmCancel(onComplete: () -> Unit) {
         _ui.update { it.copy(cancelDialogOpen = false, processingDialog = true) }
         viewModelScope.launch {
-            // Cancel only this transfer. Do not kill ping/login/receive clients or restart Tailscale.
-            transferJob?.cancelAndJoin()
-            transferJob = null
+            transferJob?.cancelAndJoin(); transferJob = null
             _ui.update { it.copy(processingDialog = false, transferring = false, transferFinished = true,
-                progressText = app.getString(R.string.transfer_canceled), progressPercent = 0,
-                doneDialog = true) }
-            stopNotification()
-            onComplete()
+                progressText = app.getString(R.string.transfer_canceled), progressPercent = 0, doneDialog = true) }
+            stopNotification(); onComplete()
         }
     }
-
     fun dismissDoneDialog() { _ui.update { it.copy(doneDialog = false) } }
-
-    fun stopNotification() {
-        // stopService does not start a new background service just to stop its notification.
-        app.stopService(Intent(app, FileTransferService::class.java))
-    }
-
+    fun stopNotification() { app.stopService(Intent(app, FileTransferService::class.java)) }
     private fun pushNotification(progress: Int, text: String) {
-        val intent = Intent(app, FileTransferService::class.java).apply {
+        app.startForegroundService(Intent(app, FileTransferService::class.java).apply {
             action = FileTransferService.ACTION_START
             putExtra(FileTransferService.EXTRA_PROGRESS, progress)
             putExtra(FileTransferService.EXTRA_CONTENT_TEXT, text)
-        }
-        app.startForegroundService(intent)
+        })
     }
-
     override fun onCleared() {
-        transferJob?.cancel()
-        refreshJob?.cancel()
-        stopNotification()
-        super.onCleared()
+        transferJob?.cancel(); refreshJob?.cancel(); stopNotification(); super.onCleared()
     }
 }

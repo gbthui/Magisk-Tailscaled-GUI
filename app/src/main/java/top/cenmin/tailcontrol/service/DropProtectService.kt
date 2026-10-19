@@ -11,26 +11,26 @@ import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import top.cenmin.tailcontrol.MainActivity
 import top.cenmin.tailcontrol.R
 import top.cenmin.tailcontrol.core.data.DropRepository
 import top.cenmin.tailcontrol.core.data.PreferencesRepository
-import top.cenmin.tailcontrol.core.data.TailscaleRepository
-import top.cenmin.tailcontrol.core.model.BackendState
-import top.cenmin.tailcontrol.core.model.ConflictBehavior
+import top.cenmin.tailcontrol.core.model.DropRequest
+import top.cenmin.tailcontrol.core.model.ReceiverPhase
 import javax.inject.Inject
 
+/** A bounded Android observer/controller. The root owner supplies the lock and expiring lease. */
 @AndroidEntryPoint
 class DropProtectService : Service() {
     companion object {
@@ -38,118 +38,115 @@ class DropProtectService : Service() {
         const val NOTIFICATION_ID = 3001
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
+        // Retained for old callers. Configuration is always read from the latest revision.
         const val EXTRA_PATH = "EXTRA_PATH"
         const val EXTRA_BEHAVIOR = "EXTRA_BEHAVIOR"
     }
 
     @Inject lateinit var prefs: PreferencesRepository
     @Inject lateinit var dropRepo: DropRepository
-    @Inject lateinit var tailRepo: TailscaleRepository
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var loopJob: Job? = null
+    private val wake = Channel<Unit>(Channel.CONFLATED)
+    @Volatile private var latestStartId = 0
+    @Volatile private var timedOut = false
+    @Volatile private var lastRequest: DropRequest? = null
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Enter foreground before any root, DataStore, or capability check can block.
-        startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.loading)))
-        when (intent?.action) {
-            ACTION_START -> startProtect(intent.getStringExtra(EXTRA_PATH),
-                ConflictBehavior.fromCli(intent.getStringExtra(EXTRA_BEHAVIOR)))
-            ACTION_STOP -> stopProtect()
-            else -> scope.launch {
-                val cfg = prefs.dropConfig.first()
-                if (cfg.enabled) startProtect(cfg.path, cfg.conflict) else stopProtect()
-            }
-        }
-        return START_STICKY
-    }
-
-    private fun startProtect(pathArg: String?, behavior: ConflictBehavior) {
-        val path = pathArg ?: "/sdcard/Download/TailDrop/"
-        val previous = loopJob
-        previous?.cancel()
-        loopJob = scope.launch {
-            previous?.join()
-            // This gate also covers Quick Settings, boot, and service restarts.
-            if (!tailRepo.isFileCommandSupported()) {
-                dropRepo.appendLog(getString(R.string.taildrop_cli_unavailable))
-                prefs.setDropEnabled(false)
-                stopProtect()
-                return@launch
-            }
-            val status = tailRepo.fetchStatus()
-            dropRepo.appendLog(getString(R.string.status) + ": " + getString(status.backendState.labelRes))
-            if (status.backendState !is BackendState.Running) {
-                dropRepo.appendLog(getString(R.string.drop_stop_due_to_tail))
-                stopProtect()
-                return@launch
-            }
-            // Each receiver has one verified PID; do not kill unrelated tailscale clients by count.
-            while (isActive) {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.createNotificationChannel(NotificationChannel(CHANNEL_ID,
+            "TailControl ${getString(R.string.drop_label)}", NotificationManager.IMPORTANCE_LOW))
+        // Exactly one consumer performs start/stop/reconfigure. No separate cleanup launch can race it.
+        scope.launch {
+            for (ignored in wake) {
+                if (timedOut) break
+                val requestId = latestStartId
+                if (requestId == 0) continue
                 try {
-                    val (storedPath, storedBehavior, pid) = prefs.loadDropRuntime()
-                    val needRestart = storedPath != path || storedBehavior != behavior
-                    if (needRestart) dropRepo.stopFileGet()
-                    val alive = !needRestart && pid != null && pid > 0 && dropRepo.isProcessAlive(pid)
-                    if (!alive) {
-                        val receiverPid = dropRepo.startFileGet(path, behavior)
-                        if (receiverPid != null) {
-                            dropRepo.appendLog(getString(R.string.msg_file_get_success, receiverPid, receiverPid))
-                            updateNotification(getString(R.string.Daemon_running))
-                        } else {
-                            dropRepo.appendLog(getString(R.string.msg_file_get_failed_no_ppid))
-                            updateNotification(getString(R.string.msg_file_get_failed_no_ppid))
+                    val request = prefs.dropRequest.first()
+                    lastRequest = request
+                    val observed = if (request.config.enabled) dropRepo.ensureRunning(request.config)
+                        else dropRepo.stopFileGet()
+                    when (observed.phase) {
+                        ReceiverPhase.PAUSED, ReceiverPhase.BLOCKED -> {
+                            if (request.config.enabled) prefs.disableDropIfRevision(request.revision)
+                            showStatus(getString(R.string.receiver_attention, observed.reason))
+                            ReceiverNotice.show(this@DropProtectService, getString(R.string.receiver_attention, observed.reason))
                         }
-                    } else {
-                        updateNotification(getString(R.string.Daemon_running))
+                        ReceiverPhase.RUNNING -> {
+                            showStatus(getString(R.string.Daemon_running))
+                            ReceiverNotice.clear(this@DropProtectService)
+                        }
+                        ReceiverPhase.UNKNOWN -> showStatus(getString(R.string.receiver_unconfirmed, observed.reason))
+                        ReceiverPhase.STARTING, ReceiverPhase.STOPPING -> showStatus(getString(R.string.loading))
+                        ReceiverPhase.STOPPED -> Unit
+                    }
+                    val latest = prefs.dropRequest.first()
+                    if (!latest.config.enabled && (observed.quiescent || observed.phase == ReceiverPhase.BLOCKED)) {
+                        // The UI's enabled flag is user intent; do not report stopped for UNKNOWN.
+                        withContext(Dispatchers.Main) {
+                            if (!timedOut && latestStartId == requestId) {
+                                if (stopSelfResult(requestId)) stopForeground(STOP_FOREGROUND_REMOVE)
+                            }
+                        }
                     }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    dropRepo.appendLog(getString(R.string.msg_file_get_unexpected, e.message.orEmpty()))
-                    Timber.e(e, "drop loop failure")
+                    dropRepo.appendLog("Receiver control failed: ${e.message}")
+                    Timber.e(e, "receiver control failure")
+                    // No new consumer on an exception. Without successful renewal, the root lease expires.
                 }
-                delay(3000)
             }
         }
+        scope.launch { prefs.dropRequest.distinctUntilChanged().collect { wake.trySend(Unit) } }
+        scope.launch { while (isActive) { delay(3000); wake.trySend(Unit) } }
     }
 
-    private fun stopProtect() {
-        val previous = loopJob
-        loopJob = null
-        previous?.cancel()
-        scope.launch {
-            previous?.join()
-            // Finish receiver cleanup before stopSelf/onDestroy cancels this scope.
-            withContext(NonCancellable) { dropRepo.stopFileGet() }
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        latestStartId = startId
+        if (timedOut) { stopSelf(startId); return START_NOT_STICKY }
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.loading)))
+            wake.trySend(Unit)
+        } catch (e: Exception) {
+            dropRepo.appendLog("Cannot enter foreground: ${e.message}")
+            finishForSystemLimit()
         }
+        // Do not evade dataSync time limits by repeatedly resurrecting this service.
+        return START_NOT_STICKY
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) { finishForSystemLimit() }
+
+    private fun finishForSystemLimit() {
+        timedOut = true
+        val generation = dropRepo.status.value.generation
+        val revision = lastRequest?.revision
+        scope.cancel() // Stop issuing renewals immediately, even if su is currently unavailable.
+        dropRepo.appendLog(getString(R.string.receiver_timed_out))
+        ReceiverNotice.show(this, getString(R.string.receiver_timed_out))
+        // Not in the service's cancelled scope. Generation and revision fence stale cleanup.
+        val cleanup = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        cleanup.launch {
+            try {
+                if (revision != null) prefs.disableDropIfRevision(revision)
+                dropRepo.requestStop(generation)
+            } finally { cleanup.cancel() }
+        }
+        // Never await su, a file copy, or DataStore before meeting Android's timeout deadline.
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     override fun onDestroy() {
         scope.cancel()
+        wake.close()
+        // Unexpected process/service destruction stops renewals. Root cleanup has a 20s lease bound.
         super.onDestroy()
     }
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        runBlocking {
-            if (!prefs.dropConfig.first().enabled) stopProtect()
-        }
-        super.onTaskRemoved(rootIntent)
-    }
-
     override fun onBind(intent: Intent?): IBinder? = null
-
-    private fun createNotificationChannel() {
-        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(NotificationChannel(CHANNEL_ID,
-            "TailControl ${getString(R.string.drop_label)}", NotificationManager.IMPORTANCE_LOW))
-    }
 
     private fun buildNotification(text: String): android.app.Notification {
         val intent = Intent(this, MainActivity::class.java).apply {
@@ -160,14 +157,11 @@ class DropProtectService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
-            .setContentTitle("TailControl Drop")
-            .setContentText(text)
-            .setOngoing(true)
-            .setContentIntent(pi)
-            .build()
+            .setContentTitle("TailControl Drop").setContentText(text)
+            .setOngoing(true).setContentIntent(pi).build()
     }
 
-    private fun updateNotification(text: String) {
+    private fun showStatus(text: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIFICATION_ID, buildNotification(text))
     }
