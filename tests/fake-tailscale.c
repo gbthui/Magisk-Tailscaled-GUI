@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
     snprintf(inbox,sizeof inbox,"%s/inbox",base);
     snprintf(modefile,sizeof modefile,"%s/mode",base);
     char mode[80]="normal";
-    FILE *m=fopen(modefile,"r"); if(m){fscanf(m,"%79s",mode); fclose(m);}
+    FILE *m=fopen(modefile,"r"); if(m){if(fscanf(m,"%79s",mode)!=1)strcpy(mode,"normal"); fclose(m);}
     if(strcmp(argv[1],"file") || strcmp(argv[2],"get")) { sleep(60); return 0; }
     int loop=0;
     for(int i=3;i<argc;i++) if(!strcmp(argv[i],"--loop")) loop=1;
