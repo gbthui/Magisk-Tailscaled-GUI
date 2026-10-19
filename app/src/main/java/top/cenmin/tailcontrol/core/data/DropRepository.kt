@@ -79,8 +79,7 @@ class DropRepository @Inject constructor(
     }
 
     private fun decode(result: CommandResult): ReceiverStatus {
-        val decoded = if (result.ok) ReceiverStatus.parse(result.out) else
-            ReceiverStatus(ReceiverPhase.UNKNOWN, reason = result.text.ifBlank { "Root command failed (${result.code})" })
+        val decoded = ReceiverStatus.fromCommand(result)
         val before = _status.value
         _status.value = decoded
         if (decoded != before) appendLog("Receiver ${decoded.phase}: ${decoded.reason}; owner=${decoded.generation ?: "?"}; pid=${decoded.pid ?: "?"}")

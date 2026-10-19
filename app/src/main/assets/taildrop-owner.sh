@@ -22,18 +22,37 @@ for name in control.lock inbox.lock probe.lock; do [ ! -L "$ROOT/$name" ] || exi
 BOOT=$(cat /proc/sys/kernel/random/boot_id) || exit 74
 UID_NOW=$(id -u) || exit 74
 
-# Only FD-based flock syntax is used (Android toybox and BusyBox compatible).
+# Select the executable, not a shell wrapper. The descriptor redirection must be on
+# the actual external command: mksh marks FDs opened by `exec N>>...` close-on-exec.
+FLOCK_APPLET=false
 if [ -x /system/bin/flock ]; then
-    lock_fd() { /system/bin/flock -n "$1"; }
+    FLOCK_TOOL=/system/bin/flock
 elif command -v flock >/dev/null 2>&1; then
-    lock_fd() { flock -n "$1"; }
+    FLOCK_TOOL=$(command -v flock)
 elif [ -x /data/adb/ksu/bin/busybox ]; then
-    lock_fd() { /data/adb/ksu/bin/busybox flock -n "$1"; }
+    FLOCK_TOOL=/data/adb/ksu/bin/busybox; FLOCK_APPLET=true
 elif [ -x /data/adb/magisk/busybox ]; then
-    lock_fd() { /data/adb/magisk/busybox flock -n "$1"; }
+    FLOCK_TOOL=/data/adb/magisk/busybox; FLOCK_APPLET=true
 else
     printf 'TC1\tUNKNOWN\t-\t0\tflock-unavailable\n'; exit 69
 fi
+lock_fd() {
+    lock_number=$1
+    if [ "$FLOCK_APPLET" = true ]; then
+        set -- "$FLOCK_TOOL" flock -n "$lock_number"
+    else
+        set -- "$FLOCK_TOOL" -n "$lock_number"
+    fi
+    # Static redirections avoid eval and preserve the same open-file-description.
+    # A redirection on the lock_fd FUNCTION CALL is insufficient on Android mksh.
+    case "$lock_number" in
+        6) "$@" 6>&6;;
+        7) "$@" 7>&7;;
+        8) "$@" 8>&8;;
+        9) "$@" 9>&9;;
+        *) printf 'Unsupported lock FD: %s\n' "$lock_number" >&2; return 64;;
+    esac
+}
 # Probe a separate uncontended inode so utility errors are not mistaken for lock contention.
 probe=$(mktemp "$ROOT/probe.XXXXXX") || exit 74
 probe_ok=0
@@ -141,6 +160,10 @@ status() {
     fi
     # A dead supervisor is not proof its receiver is dead. Keep the inbox blocked.
     if ! lock_free; then report UNKNOWN 0 receiver-outlived-supervisor; return; fi
+    # The supervisor may have published PAUSED while we were checking its identity.
+    # Re-read after proving the lock is free so its precise failure is not overwritten.
+    read_all "$SESSION/state" || { report UNKNOWN 0 unreadable-state; return; }
+    phase=$VALUE
     if [ "$phase" = PAUSED ]; then
         report PAUSED 0 "$(cat "$SESSION/reason" 2>/dev/null)"; return
     fi
@@ -214,7 +237,8 @@ if [ "$ACTION" = child ]; then
     printf '%s\000' "$CLI" file get --verbose "--conflict=$policy" -- "$directory" > "$SESSION/child.argv" || exit 74
     digest=$(sha256sum "$SESSION/child.argv"); digest=${digest%% *}
     atomic "$SESSION/child" "$BOOT $$ $ISTART $UID_NOW $digest" || exit 74
-    exec "$CLI" file get --verbose "--conflict=$policy" -- "$directory"
+    # Explicitly keep the lock at the final native exec boundary as well.
+    exec "$CLI" file get --verbose "--conflict=$policy" -- "$directory" 8>&8
     exit 126
 fi
 
@@ -270,7 +294,8 @@ if [ "$ACTION" = supervise ]; then
         # A durable uncertainty marker prevents automatic replay after a supervisor/App crash.
         atomic "$SESSION/pending" batch-started || exit 74
         rm -f "$SESSION/child"
-        "$SH" "$SELF" child "$ROOT" "$CLI" "$TOKEN" 9>&- 7>&- >> "$ROOT/receiver.log" 2>&1 &
+        # mksh does not implicitly inherit a high FD opened in this supervisor.
+        "$SH" "$SELF" child "$ROOT" "$CLI" "$TOKEN" 8>&8 9>&- 7>&- >> "$ROOT/receiver.log" 2>&1 &
         CHILD=$!
         grace=0
         while :; do

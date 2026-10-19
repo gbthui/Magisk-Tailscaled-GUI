@@ -12,6 +12,7 @@ import unittest
 BASE=Path(__file__).resolve().parents[1]
 SCRIPT=BASE/'app/src/main/assets/taildrop-owner.sh'
 CLI=BASE/'tests/tailscale'
+TEST_SH=os.environ.get('TC_TEST_SH', '/bin/sh')
 
 class OwnerTests(unittest.TestCase):
     def setUp(self):
@@ -19,11 +20,11 @@ class OwnerTests(unittest.TestCase):
         self.root=self.tmp/'root'
         self.dest=self.tmp/'dest'
         self.dest.mkdir()
-        self.env=dict(os.environ, TC_SH='/bin/sh', TC_FIXTURE=str(self.tmp))
+        self.env=dict(os.environ, TC_SH=TEST_SH, TC_FIXTURE=str(self.tmp))
         (self.tmp/'mode').write_text('normal')
         self.extra=[]
     def call(self,action,*args):
-        p=subprocess.run(['/bin/sh',str(SCRIPT),action,str(self.root),str(CLI),*map(str,args)],
+        p=subprocess.run([TEST_SH,str(SCRIPT),action,str(self.root),str(CLI),*map(str,args)],
              env=self.env,text=True,capture_output=True,timeout=12)
         return p.stdout.strip(),p.stderr,p.returncode
     def start(self,token='one',directory=None):
@@ -102,7 +103,7 @@ class OwnerTests(unittest.TestCase):
         (session/'lease').write_text('0')
         self.assertEqual(self.status()[1],'STOPPED')
     def test_closed_start_response_preserves_root_owner(self):
-        proc=subprocess.Popen(['/bin/sh',str(SCRIPT),'start',str(self.root),str(CLI),'one',str(self.dest),'rename'],
+        proc=subprocess.Popen([TEST_SH,str(SCRIPT),'start',str(self.root),str(CLI),'one',str(self.dest),'rename'],
             env=self.env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
         proc.stdout.close()
         proc.wait(timeout=10)

@@ -1,5 +1,7 @@
 package top.cenmin.tailcontrol.core.model
 
+import top.cenmin.tailcontrol.core.shell.CommandResult
+
 /** UNKNOWN is not STOPPED: a failed root/proc probe must never trigger another consumer. */
 enum class ReceiverPhase { STARTING, RUNNING, STOPPING, STOPPED, PAUSED, BLOCKED, UNKNOWN }
 
@@ -12,6 +14,21 @@ data class ReceiverStatus(
     val quiescent: Boolean get() = phase == ReceiverPhase.STOPPED || phase == ReceiverPhase.PAUSED
 
     companion object {
+        /** Structured diagnostics can accompany a nonzero helper exit (for example exit 69).
+         * Keep the useful reason, but never turn a failed command into a healthy receiver.
+         * Raw TC1 records are protocol, not user-facing error messages.
+         */
+        fun fromCommand(result: CommandResult): ReceiverStatus {
+            val parsed = parse(result.out)
+            if (result.ok) return parsed
+            val diagnostics = (result.out + result.err)
+                .filterNot { it.startsWith("TC1\t") }
+                .joinToString("\n").trim().takeLast(2048)
+            val summary = "${parsed.reason.ifBlank { "Root owner command failed" }} (exit ${result.code})"
+            return parsed.copy(phase = ReceiverPhase.UNKNOWN,
+                reason = if (diagnostics.isBlank()) summary else "$summary: $diagnostics")
+        }
+
         fun parse(lines: List<String>): ReceiverStatus {
             val fields = lines.firstOrNull { it.startsWith("TC1\t") }?.split('\t')
                 ?: return ReceiverStatus(ReceiverPhase.UNKNOWN, reason = "Missing root owner response")
