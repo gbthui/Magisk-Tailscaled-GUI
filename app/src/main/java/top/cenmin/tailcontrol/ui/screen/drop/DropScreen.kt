@@ -102,7 +102,7 @@ fun DropScreen(viewModel: DropViewModel = hiltViewModel()) {
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            stringResource(R.string.drop_unavailable_msg),
+                            stringResource(R.string.taildrop_cli_unavailable),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onErrorContainer,
                         )

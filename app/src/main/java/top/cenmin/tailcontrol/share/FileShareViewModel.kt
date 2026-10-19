@@ -4,24 +4,32 @@ import android.app.Application
 import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.text.format.Formatter
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import top.cenmin.tailcontrol.R
 import top.cenmin.tailcontrol.core.data.TailscaleRepository
 import top.cenmin.tailcontrol.core.model.BackendState
 import top.cenmin.tailcontrol.core.model.TailscaleDevice
+import top.cenmin.tailcontrol.core.shell.ProcessIo
+import top.cenmin.tailcontrol.core.shell.RootShell
+import top.cenmin.tailcontrol.core.shell.ShellCommand
 import top.cenmin.tailcontrol.service.FileTransferService
+import java.io.IOException
 import javax.inject.Inject
-import com.topjohnwu.superuser.Shell
 
 data class FileShareUiState(
     val fileUri: Uri? = null,
@@ -45,21 +53,24 @@ data class FileShareUiState(
 class FileShareViewModel @Inject constructor(
     private val app: Application,
     private val tailRepo: TailscaleRepository,
+    private val shell: RootShell,
 ) : ViewModel() {
-
     private val _ui = MutableStateFlow(FileShareUiState())
     val ui: StateFlow<FileShareUiState> = _ui.asStateFlow()
-
     private var transferJob: Job? = null
     private var refreshJob: Job? = null
 
     fun bind(uri: Uri) {
-        val name = app.contentResolver.query(uri, null, null, null, null)?.use { c ->
-            val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            c.moveToFirst(); c.getString(idx)
-        } ?: "shared_file"
-        val total = runCatching { app.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1 }.getOrDefault(-1)
-        _ui.value = _ui.value.copy(fileUri = uri, fileName = name, totalBytes = total)
+        val name = runCatching {
+            app.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (column >= 0 && cursor.moveToFirst()) cursor.getString(column) else null
+            }
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: "shared_file"
+        val total = runCatching {
+            app.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1
+        }.getOrDefault(-1)
+        _ui.update { it.copy(fileUri = uri, fileName = name, totalBytes = total) }
         startAutoRefresh()
     }
 
@@ -69,7 +80,7 @@ class FileShareViewModel @Inject constructor(
             while (isActive) {
                 refreshOnce()
                 for (i in 5 downTo 1) {
-                    _ui.value = _ui.value.copy(countdown = i)
+                    _ui.update { it.copy(countdown = i) }
                     delay(1000)
                 }
             }
@@ -79,330 +90,112 @@ class FileShareViewModel @Inject constructor(
     fun refreshOnce() {
         viewModelScope.launch(Dispatchers.IO) {
             val status = tailRepo.fetchStatus()
-            val state = status.backendState
-            _ui.value = _ui.value.copy(tailscaleState = state)
-            if (state is BackendState.Running) {
-                val online = status.self?.online == true
-                if (!online) {
-                    _ui.value = _ui.value.copy(showOfflineDialog = true)
-                } else {
-                    _ui.value = _ui.value.copy(peers = status.peers)
-                }
-            } else {
-                _ui.value = _ui.value.copy(showNotRunningDialog = true)
+            _ui.update { current ->
+                current.copy(
+                    tailscaleState = status.backendState,
+                    peers = status.peers,
+                    showNotRunningDialog = status.backendState !is BackendState.Running,
+                    showOfflineDialog = status.backendState is BackendState.Running && status.self?.online != true,
+                )
             }
         }
     }
 
     fun startTailscale() {
         viewModelScope.launch(Dispatchers.IO) {
-            tailRepo.up()
+            val result = tailRepo.up()
+            if (!result.ok) showFailure(result.text)
             refreshOnce()
         }
     }
 
-    fun dismissNotRunning() { _ui.value = _ui.value.copy(showNotRunningDialog = false) }
-    fun dismissOffline() { _ui.value = _ui.value.copy(showOfflineDialog = false) }
+    fun dismissNotRunning() { _ui.update { it.copy(showNotRunningDialog = false) } }
+    fun dismissOffline() { _ui.update { it.copy(showOfflineDialog = false) } }
 
+    /** Known, unknown, and zero-byte files all use the same command and IO lifecycle. */
     fun send(peer: TailscaleDevice) {
-        val uri = _ui.value.fileUri ?: return
-        val fileName = _ui.value.fileName
-        val total = _ui.value.totalBytes
-
-        if (total <= 0) {
-            // 如果无法获取文件大小，则使用原来的网卡监控方式
-            sendWithTrafficMonitoring(peer, uri, fileName)
-            return
-        }
-
-        _ui.value = _ui.value.copy(transferring = true, progressPercent = 0, progressText = "0%")
+        if (_ui.value.transferring || transferJob?.isActive == true) return
+        val current = _ui.value
+        val uri = current.fileUri ?: return
+        val total = current.totalBytes
+        val initial = TransferProgress.percent(0, total)
+        val initialText = progressText(0, initial)
+        _ui.update { it.copy(transferring = true, transferFinished = false,
+            progressPercent = initial, progressText = initialText) }
 
         transferJob = viewModelScope.launch(Dispatchers.IO) {
-            val cmd = "tailscale file cp --verbose --name \"$fileName\" - ${peer.name}:"
-            val stderr = mutableListOf<String>()
-
             try {
-                val process = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-
-                // 分块写入 stdin 并实时更新进度
-                val writeJob = viewModelScope.launch(Dispatchers.IO) {
-                    runCatching {
-                        app.contentResolver.openInputStream(uri)?.use { input ->
-                            process.outputStream.use { output ->
-                                val buffer = ByteArray(64 * 1024) // 64KB 缓冲区
-                                var totalWritten = 0L
-                                var lastProgressPercent = 0
-
-                                while (isActive) {
-                                    val read = input.read(buffer)
-                                    if (read <= 0) break
-
-                                    output.write(buffer, 0, read)
-                                    output.flush()
-
-                                    totalWritten += read
-                                    // 限制最大进度为 99%，避免未完成就显示 100%
-                                    var currentPercent = ((totalWritten.toDouble() / total) * 100).toInt()
-                                    if (currentPercent >= 100) currentPercent = 99
-
-                                    // 每变化 1% 或每 1MB 更新一次 UI，避免过于频繁
-                                    if (currentPercent > lastProgressPercent || totalWritten % (1024 * 1024) < buffer.size) {
-                                        lastProgressPercent = currentPercent
-                                        withContext(Dispatchers.Main) {
-                                            _ui.value = _ui.value.copy(
-                                                progressPercent = currentPercent,
-                                                progressText = "$currentPercent%"
-                                            )
-                                        }
-                                        pushNotification(currentPercent, "$currentPercent%")
-                                    }
-                                }
-                            }
-                        }
+                pushNotification(initial, initialText)
+                val target = peer.ipv4 ?: peer.ipv6?.let { "[$it]" }
+                    ?: peer.dnsName.trimEnd('.').ifBlank { peer.name }
+                val command = ShellCommand.fileSend(current.fileName, target)
+                val input = app.contentResolver.openInputStream(uri)
+                    ?: throw IOException("Cannot open the shared file")
+                val process = try {
+                    shell.startProcess(*command)
+                } catch (e: Exception) {
+                    input.close()
+                    throw e
+                }
+                var lastUpdate = 0L
+                var lastPercent = initial
+                val result = ProcessIo.transfer(process, input, total) { bytes ->
+                    val percent = TransferProgress.percent(bytes, total)
+                    val now = System.nanoTime()
+                    if (percent != lastPercent || now - lastUpdate >= 250_000_000L) {
+                        lastUpdate = now
+                        lastPercent = percent
+                        val text = progressText(bytes, percent)
+                        _ui.update { it.copy(progressPercent = percent, progressText = text) }
+                        pushNotification(percent, text)
                     }
                 }
-
-                // 同时读取错误流
-                val errorJob = viewModelScope.launch(Dispatchers.IO) {
-                    process.errorStream.bufferedReader().forEachLine { line ->
-                        synchronized(stderr) { stderr.add(line) }
-                    }
-                }
-
-                val exit = process.waitFor()
-                writeJob.cancel()
-                errorJob.cancel()
-
-                withContext(Dispatchers.Main) {
-                    if (exit == 0) {
-                        _ui.value = _ui.value.copy(
-                            transferring = false,
-                            transferFinished = true,
-                            progressPercent = 100,
-                            progressText = app.getString(top.cenmin.tailcontrol.R.string.transfer_complete_progress)
-                        )
-                        pushNotification(100, app.getString(top.cenmin.tailcontrol.R.string.transfer_complete))
-                    } else {
-                        val errText = synchronized(stderr) { stderr.joinToString("\n").trim() }
-                        _ui.value = _ui.value.copy(
-                            transferring = false,
-                            transferFinished = true,
-                            progressText = app.getString(top.cenmin.tailcontrol.R.string.transfer_failed, errText.ifEmpty { "Unknown error" }),
-                        )
-                    }
-                }
-            } catch (t: Throwable) {
-                withContext(Dispatchers.Main) {
-                    _ui.value = _ui.value.copy(
-                        transferring = false,
-                        progressText = app.getString(top.cenmin.tailcontrol.R.string.transfer_failed, t.message.orEmpty()),
-                    )
-                }
+                if (!result.ok) throw IOException(result.text.ifBlank { "CLI exited with code ${result.code}" })
+                _ui.update { it.copy(transferring = false, transferFinished = true, progressPercent = 100,
+                    progressText = app.getString(R.string.transfer_complete_progress)) }
+                pushNotification(100, app.getString(R.string.transfer_complete))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                showFailure(e.message ?: "Unable to transfer file")
+            } finally {
+                // ProcessIo owns process/pipe cleanup, including cancellation and producer failures.
+                if (_ui.value.progressPercent != 100) stopNotification()
             }
         }
     }
 
-    // 原有的网卡监控方式作为备用（当无法获取文件大小时使用）
-    private fun sendWithTrafficMonitoring(peer: TailscaleDevice, uri: Uri, fileName: String) {
-        val total = _ui.value.totalBytes
-        _ui.value = _ui.value.copy(transferring = true, progressPercent = 0, progressText = "0%")
+    private fun progressText(bytes: Long, percent: Int): String = if (percent < 0) {
+        app.getString(R.string.taildrop_processed_bytes, Formatter.formatShortFileSize(app, bytes))
+    } else "$percent%"
 
-        transferJob = viewModelScope.launch(Dispatchers.IO) {
-            val cmd = "tailscale file cp --verbose --name \"$fileName\" - ${peer.name}:"
-            val stderr = mutableListOf<String>()
-            try {
-                // libsu 不暴露 stdin 写入，这里用 Runtime.exec 直接拿到 outputStream 把 content 流写过去
-                val process = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-
-                // stdin
-                val stdinJob = viewModelScope.launch(Dispatchers.IO) {
-                    runCatching {
-                        app.contentResolver.openInputStream(uri)?.use { input ->
-                            process.outputStream.use { output ->
-                                input.copyTo(output)
-                                output.flush()
-                            }
-                        }
-                    }
-                }
-
-                // 通过 /proc 监控网卡流量来估算进度
-                val pid = tailRepo.pidofTailscaled()
-                val trafficJob = if (pid != null && total > 0) viewModelScope.launch(Dispatchers.IO) {
-                    var lastTotalTx: Long = -1
-                    var lastTailscaleTx: Long = -1
-                    var activeInterface: String? = null
-
-                    while (isActive && process.isAlive) {
-                        runCatching {
-                            val raw = Shell.cmd("cat /proc/$pid/net/dev").exec().out.joinToString("\n")
-
-                            // 优先尝试 tailscale0
-                            val tailscaleLine = raw.lineSequence().firstOrNull { it.contains("tailscale0:") }
-                            var currentTx = tailscaleLine?.let { parseTxBytes(it) } ?: 0L
-                            var useFallback = false
-
-                            if (activeInterface == null || activeInterface == "tailscale0") {
-                                if (lastTailscaleTx >= 0) {
-                                    val delta = currentTx - lastTailscaleTx
-                                    if (delta <= 300) {
-                                        useFallback = true
-                                    } else {
-                                        activeInterface = "tailscale0"
-                                    }
-                                } else {
-                                    lastTailscaleTx = currentTx
-                                    delay(1000)
-                                    return@runCatching
-                                }
-                            }
-
-                            // 降级到 wlan* 接口
-                            if (useFallback || activeInterface == "wlan") {
-                                val wlanTotal = raw.lineSequence()
-                                    .filter { it.contains("wlan") && it.contains(":") }
-                                    .sumOf { parseTxBytes(it) }
-
-                                if (lastTotalTx >= 0 && activeInterface != "wlan") {
-                                    val delta = wlanTotal - lastTotalTx
-                                    if (delta > 300) {
-                                        activeInterface = "wlan"
-                                        currentTx = wlanTotal
-                                        useFallback = false
-                                    }
-                                }
-                                lastTotalTx = wlanTotal
-                                if (useFallback) currentTx = wlanTotal
-                            }
-
-                            // 降级到 rmnet_* 接口
-                            if (useFallback || activeInterface == "rmnet") {
-                                val rmnetTotal = raw.lineSequence()
-                                    .filter { it.contains("rmnet_") && it.contains(":") }
-                                    .sumOf { parseTxBytes(it) }
-
-                                if (lastTotalTx >= 0 && activeInterface != "rmnet") {
-                                    val delta = rmnetTotal - lastTotalTx
-                                    if (delta > 300) {
-                                        activeInterface = "rmnet"
-                                        currentTx = rmnetTotal
-                                        useFallback = false
-                                    }
-                                }
-                                lastTotalTx = rmnetTotal
-                                if (useFallback) currentTx = rmnetTotal
-                            }
-
-                            // 最后降级到 p2p0
-                            if (useFallback || activeInterface == "p2p") {
-                                val p2pTx = raw.lineSequence()
-                                    .firstOrNull { it.contains("p2p0:") }
-                                    ?.let { parseTxBytes(it) } ?: 0L
-
-                                if (lastTotalTx >= 0 && activeInterface != "p2p") {
-                                    val delta = p2pTx - lastTotalTx
-                                    if (delta > 300) {
-                                        activeInterface = "p2p"
-                                        currentTx = p2pTx
-                                    }
-                                }
-                                lastTotalTx = p2pTx
-                                if (useFallback) currentTx = p2pTx
-                            }
-
-                            // 计算进度
-                            if (lastTailscaleTx >= 0 && lastTotalTx >= 0) {
-                                val lastTx = when (activeInterface) {
-                                    "tailscale0" -> lastTailscaleTx
-                                    else -> lastTotalTx
-                                }
-                                val delta = currentTx - lastTx
-                                var pct = ((delta.toDouble() / total) * 100).toInt().coerceIn(0, 99)
-                                if (pct >= 100) pct = 99
-                                withContext(Dispatchers.Main) {
-                                    _ui.value = _ui.value.copy(progressPercent = pct, progressText = "$pct%")
-                                }
-                                pushNotification(pct, "$pct%")
-                            }
-
-                            if (activeInterface == "tailscale0") {
-                                lastTailscaleTx = currentTx
-                            } else {
-                                lastTotalTx = currentTx
-                            }
-                        }
-                        delay(150)
-                    }
-                } else null
-
-                process.errorStream.bufferedReader().forEachLine { line -> stderr.add(line) }
-                val exit = process.waitFor()
-                stdinJob.cancel()
-                trafficJob?.cancel()
-
-                withContext(Dispatchers.Main) {
-                    if (exit == 0) {
-                        _ui.value = _ui.value.copy(
-                            transferring = false,
-                            transferFinished = true,
-                            progressPercent = 100,
-                            progressText = app.getString(top.cenmin.tailcontrol.R.string.transfer_complete_progress)
-                        )
-                        pushNotification(100, app.getString(top.cenmin.tailcontrol.R.string.transfer_complete))
-                    } else {
-                        val errText = stderr.joinToString("\n").trim()
-                        _ui.value = _ui.value.copy(
-                            transferring = false,
-                            transferFinished = true,
-                            progressText = app.getString(top.cenmin.tailcontrol.R.string.transfer_failed, errText.ifEmpty { "Unknown error" }),
-                        )
-                    }
-                }
-            } catch (t: Throwable) {
-                withContext(Dispatchers.Main) {
-                    _ui.value = _ui.value.copy(
-                        transferring = false,
-                        progressText = app.getString(top.cenmin.tailcontrol.R.string.transfer_failed, t.message.orEmpty()),
-                    )
-                }
-            }
-        }
+    private fun showFailure(message: String) {
+        _ui.update { it.copy(transferring = false, transferFinished = true,
+            progressText = app.getString(R.string.transfer_failed, message)) }
     }
 
-    // 辅助函数：解析网卡行中的 TX bytes（第10列，索引9）
-    private fun parseTxBytes(line: String): Long {
-        val afterColon = line.substringAfter(":").trim()
-        val tokens = afterColon.split(Regex("\\s+"))
-        return tokens.getOrNull(8)?.toLongOrNull() ?: 0L
-    }
-
-    fun openCancelDialog() { _ui.value = _ui.value.copy(cancelDialogOpen = true) }
-    fun dismissCancelDialog() { _ui.value = _ui.value.copy(cancelDialogOpen = false) }
+    fun openCancelDialog() { _ui.update { it.copy(cancelDialogOpen = true) } }
+    fun dismissCancelDialog() { _ui.update { it.copy(cancelDialogOpen = false) } }
 
     fun confirmCancel(onComplete: () -> Unit) {
-        _ui.value = _ui.value.copy(cancelDialogOpen = false, processingDialog = true)
-        viewModelScope.launch(Dispatchers.IO) {
-            tailRepo.killAllTailscale()
-            tailRepo.up()
-            withContext(Dispatchers.Main) {
-                _ui.value = _ui.value.copy(
-                    processingDialog = false,
-                    transferring = false,
-                    progressText = app.getString(top.cenmin.tailcontrol.R.string.transfer_canceled),
-                    progressPercent = 0,
-                    doneDialog = true,
-                )
-                stopNotification()
-                onComplete()
-            }
+        _ui.update { it.copy(cancelDialogOpen = false, processingDialog = true) }
+        viewModelScope.launch {
+            // Cancel only this transfer. Do not kill ping/login/receive clients or restart Tailscale.
+            transferJob?.cancelAndJoin()
+            transferJob = null
+            _ui.update { it.copy(processingDialog = false, transferring = false, transferFinished = true,
+                progressText = app.getString(R.string.transfer_canceled), progressPercent = 0,
+                doneDialog = true) }
+            stopNotification()
+            onComplete()
         }
     }
 
-    fun dismissDoneDialog() { _ui.value = _ui.value.copy(doneDialog = false) }
+    fun dismissDoneDialog() { _ui.update { it.copy(doneDialog = false) } }
 
     fun stopNotification() {
-        val intent = Intent(app, FileTransferService::class.java).apply { action = FileTransferService.ACTION_STOP }
-        app.startService(intent)
+        // stopService does not start a new background service just to stop its notification.
+        app.stopService(Intent(app, FileTransferService::class.java))
     }
 
     private fun pushNotification(progress: Int, text: String) {
@@ -415,8 +208,9 @@ class FileShareViewModel @Inject constructor(
     }
 
     override fun onCleared() {
-        super.onCleared()
         transferJob?.cancel()
         refreshJob?.cancel()
+        stopNotification()
+        super.onCleared()
     }
 }

@@ -9,11 +9,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import androidx.navigation.toRoute
 import top.cenmin.tailcontrol.core.data.TailscaleRepository
 import top.cenmin.tailcontrol.core.model.TailscaleDevice
 import top.cenmin.tailcontrol.core.model.WhoisInfo
+import top.cenmin.tailcontrol.core.shell.ShellCommand
 import top.cenmin.tailcontrol.ui.nav.Destinations
 import javax.inject.Inject
 
@@ -55,13 +57,13 @@ class PeerDetailViewModel @Inject constructor(
         }
     }
 
-    /** 给用户一个可复制的 tailscale ssh 命令（在 Termux 里执行）。 */
+    /** The copied command needs its own root/PATH setup; the terminal still needs an SSH client. */
     val sshCommand: String?
         get() = _ui.value.peer?.let { peer ->
             val host = peer.dnsName.trimEnd('.').takeIf { it.isNotBlank() }
                 ?: peer.name.takeIf { it.isNotBlank() }
                 ?: return null
-            "tailscale ssh $host"
+            ShellCommand.argv("su", "-c", ShellCommand.process("tailscale", "ssh", "--", host))
         }
 
     val avgRtt: Double

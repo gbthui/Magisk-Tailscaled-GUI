@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="taildrop_processed_bytes">已处理 %1$s，等待传输完成确认</string>
+    <string name="taildrop_cancel_this_transfer">取消本次文件传输？其他 Tailscale 操作不会被停止。</string>
+    <string name="taildrop_cli_unavailable">当前 CLI 无法运行 Taildrop。请检查 Root 授权、可执行文件路径以及 file cp/get 命令支持情况。</string>
+</resources>

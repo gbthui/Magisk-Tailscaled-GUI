@@ -8,14 +8,12 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
-import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import top.cenmin.tailcontrol.R
 import top.cenmin.tailcontrol.share.FileShareActivity
 
 class FileTransferService : Service() {
-
     companion object {
         const val CHANNEL_ID = "TAILSCALE_FILE_CHANNEL"
         const val NOTIFICATION_ID = 2001
@@ -44,57 +42,44 @@ class FileTransferService : Service() {
             ACTION_START -> {
                 val progress = intent.getIntExtra(EXTRA_PROGRESS, 0)
                 val text = intent.getStringExtra(EXTRA_CONTENT_TEXT) ?: getString(R.string.waiting)
-                builder.setContentText(text).setProgress(100, progress, false)
-
+                builder.setContentText(text).setProgress(100, progress.coerceIn(0, 100), progress < 0)
                 val openIntent = Intent(this, FileShareActivity::class.java)
                     .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                builder.setContentIntent(
-                    PendingIntent.getActivity(
-                        this, 0, openIntent,
-                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
-                    ),
-                )
-
+                builder.setContentIntent(PendingIntent.getActivity(this, 0, openIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
                 val canPost = Build.VERSION.SDK_INT < 33 ||
                     checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
-                if (canPost) {
-                    if (!isForegroundStarted) {
-                        startForeground(NOTIFICATION_ID, builder.build())
-                        isForegroundStarted = true
-                    } else {
-                        NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, builder.build())
-                    }
+                // Foreground service startup is required even when notification permission is denied.
+                if (!isForegroundStarted) {
+                    startForeground(NOTIFICATION_ID, builder.build())
+                    isForegroundStarted = true
+                } else if (canPost) {
+                    NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, builder.build())
                 }
-
-                if (progress >= 100 || text.contains(getString(R.string.transfer_complete), true)) {
-                    builder.setOngoing(false).setProgress(0, 0, false).setContentIntent(null)
-                    if (canPost) {
-                        NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, builder.build())
-                        @Suppress("DEPRECATION") stopForeground(true)
-                    } else {
-                        Toast.makeText(this, getString(R.string.transfer_complete), Toast.LENGTH_SHORT).show()
-                    }
+                if (progress >= 100) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
             }
             ACTION_STOP -> {
-                @Suppress("DEPRECATION") stopForeground(true)
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }
-        return START_STICKY
+        // The ViewModel owns the transfer; do not resurrect an orphaned notification.
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        super.onDestroy()
     }
 
     private fun createNotificationChannel() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_ID,
-                "Tailscale ${getString(R.string.file_transfer)}",
-                NotificationManager.IMPORTANCE_LOW,
-            ),
-        )
+        nm.createNotificationChannel(NotificationChannel(CHANNEL_ID,
+            "Tailscale ${getString(R.string.file_transfer)}", NotificationManager.IMPORTANCE_LOW))
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

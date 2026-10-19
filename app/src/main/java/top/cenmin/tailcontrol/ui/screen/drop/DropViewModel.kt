@@ -11,10 +11,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import top.cenmin.tailcontrol.R
 import top.cenmin.tailcontrol.core.data.DropRepository
 import top.cenmin.tailcontrol.core.data.PreferencesRepository
 import top.cenmin.tailcontrol.core.data.TailscaleRepository
@@ -45,45 +47,43 @@ class DropViewModel @Inject constructor(
     private val tailRepo: TailscaleRepository,
     private val dropRepo: DropRepository,
 ) : ViewModel() {
-
     private val _ui = MutableStateFlow(DropUiState())
     val ui: StateFlow<DropUiState> = _ui.asStateFlow()
-
     private var pingJob: Job? = null
-
     val daemonOutput: StateFlow<String> = dropRepo.output
         .stateIn(viewModelScope, SharingStarted.Eagerly, "")
 
     init {
         viewModelScope.launch {
             combine(prefs.dropConfig, prefs.pingAddress) { c, p -> c to p }
-                .collect { (config, ping) ->
-                    _ui.value = _ui.value.copy(config = config, pingAddress = ping)
-                }
+                .collect { (config, ping) -> _ui.value = _ui.value.copy(config = config, pingAddress = ping) }
         }
         viewModelScope.launch(Dispatchers.IO) {
-            val supported = tailRepo.isFileCommandSupported()
-            _ui.value = _ui.value.copy(fileCommandSupported = supported)
+            _ui.value = _ui.value.copy(fileCommandSupported = tailRepo.isFileCommandSupported())
         }
         refreshTailscaleState()
     }
 
     fun refreshTailscaleState() {
         viewModelScope.launch(Dispatchers.IO) {
-            val s = tailRepo.fetchStatus()
-            _ui.value = _ui.value.copy(tailscaleState = s.backendState)
+            _ui.value = _ui.value.copy(tailscaleState = tailRepo.fetchStatus().backendState)
         }
     }
 
     fun setEnabled(target: Boolean) {
         viewModelScope.launch {
-            if (target && !_ui.value.fileCommandSupported) {
-                _ui.value = _ui.value.copy(errorToast = "tailscale 1.90+ removed `file` subcommand")
-                return@launch
-            }
-            if (target && _ui.value.tailscaleState !is BackendState.Running) {
-                _ui.value = _ui.value.copy(errorToast = "Tailscale not running")
-                return@launch
+            // Re-probe on enable, including after a module update or a previous root denial.
+            if (target) {
+                val supported = tailRepo.isFileCommandSupported()
+                _ui.value = _ui.value.copy(fileCommandSupported = supported)
+                if (!supported) {
+                    _ui.value = _ui.value.copy(errorToast = app.getString(R.string.taildrop_cli_unavailable))
+                    return@launch
+                }
+                if (tailRepo.fetchStatus().backendState !is BackendState.Running) {
+                    _ui.value = _ui.value.copy(errorToast = "Tailscale not running")
+                    return@launch
+                }
             }
             prefs.setDropEnabled(target)
             val cfg = prefs.dropConfig.first()
@@ -98,14 +98,8 @@ class DropViewModel @Inject constructor(
         }
     }
 
-    fun setPath(path: String) {
-        viewModelScope.launch { prefs.setDropPath(path) }
-    }
-
-    fun setConflict(behavior: ConflictBehavior) {
-        viewModelScope.launch { prefs.setConflict(behavior) }
-    }
-
+    fun setPath(path: String) { viewModelScope.launch { prefs.setDropPath(path) } }
+    fun setConflict(behavior: ConflictBehavior) { viewModelScope.launch { prefs.setConflict(behavior) } }
     fun setPingAddress(addr: String) {
         _ui.value = _ui.value.copy(pingAddress = addr)
         viewModelScope.launch { prefs.setPingAddress(addr) }
@@ -117,14 +111,14 @@ class DropViewModel @Inject constructor(
         pingJob?.cancel()
         _ui.value = _ui.value.copy(pingDialogOpen = true, pingOutput = "", isPinging = true)
         pingJob = viewModelScope.launch(Dispatchers.IO) {
-            tailRepo.ping(addr).collect { line ->
-                val cur = _ui.value
-                _ui.value = cur.copy(pingOutput = (cur.pingOutput + line + "\n"))
+            try {
+                tailRepo.ping(addr).collect { line ->
+                    val cur = _ui.value
+                    _ui.value = cur.copy(pingOutput = cur.pingOutput + line + "\n")
+                }
+            } finally {
+                _ui.value = _ui.value.copy(isPinging = false)
             }
-        }
-        viewModelScope.launch {
-            pingJob?.join()
-            _ui.value = _ui.value.copy(isPinging = false)
         }
     }
 
@@ -133,37 +127,23 @@ class DropViewModel @Inject constructor(
         pingJob = null
         _ui.value = _ui.value.copy(isPinging = false)
     }
-
     fun closePingDialog() {
         if (_ui.value.isPinging) stopPing()
         _ui.value = _ui.value.copy(pingDialogOpen = false)
     }
-
     fun openKillDialog() {
         viewModelScope.launch(Dispatchers.IO) {
-            val n = tailRepo.pgrepTailscaleCount()
-            _ui.value = _ui.value.copy(killDialogOpen = true, processCount = n)
+            _ui.value = _ui.value.copy(killDialogOpen = true, processCount = tailRepo.pgrepTailscaleCount())
         }
     }
-
     fun confirmKillProcesses() {
         viewModelScope.launch(Dispatchers.IO) {
             tailRepo.killAllTailscale()
             prefs.setDropEnabled(false)
-            // 同时停 drop 服务
-            val intent = Intent(app, DropProtectService::class.java).apply {
-                action = DropProtectService.ACTION_STOP
-            }
-            app.startService(intent)
+            app.startService(Intent(app, DropProtectService::class.java).apply { action = DropProtectService.ACTION_STOP })
             _ui.value = _ui.value.copy(killDialogOpen = false)
         }
     }
-
-    fun dismissKillDialog() {
-        _ui.value = _ui.value.copy(killDialogOpen = false)
-    }
-
-    fun consumeError() {
-        _ui.value = _ui.value.copy(errorToast = null)
-    }
+    fun dismissKillDialog() { _ui.value = _ui.value.copy(killDialogOpen = false) }
+    fun consumeError() { _ui.value = _ui.value.copy(errorToast = null) }
 }
