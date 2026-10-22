@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="taildrop_processed_bytes">Processed %1$s; waiting for confirmation</string>
+    <string name="taildrop_cancel_this_transfer">Cancel this file transfer? Other Tailscale operations will not be stopped.</string>
+    <string name="taildrop_cli_unavailable">Cannot run Taildrop with the installed CLI. Check root access, executable paths, and support for the file cp/get commands.</string>
+</resources>

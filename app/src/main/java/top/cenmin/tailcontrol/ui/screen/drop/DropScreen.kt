@@ -55,6 +55,7 @@ import top.cenmin.tailcontrol.core.model.ConflictBehavior
 fun DropScreen(viewModel: DropViewModel = hiltViewModel()) {
     val ui by viewModel.ui.collectAsStateWithLifecycle()
     val daemonOutput by viewModel.daemonOutput.collectAsStateWithLifecycle()
+    val receiver by viewModel.receiverStatus.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     LaunchedEffect(ui.errorToast) {
@@ -102,7 +103,7 @@ fun DropScreen(viewModel: DropViewModel = hiltViewModel()) {
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            stringResource(R.string.drop_unavailable_msg),
+                            stringResource(R.string.taildrop_cli_unavailable),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onErrorContainer,
                         )
@@ -110,7 +111,7 @@ fun DropScreen(viewModel: DropViewModel = hiltViewModel()) {
                 }
             }
 
-            // 1. Receive daemon
+            // 1. Receive daemon: the switch is user intent, not proof that a root process stopped.
             ElevatedCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp).fillMaxWidth()) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -119,20 +120,17 @@ fun DropScreen(viewModel: DropViewModel = hiltViewModel()) {
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
                         )
                         Spacer(Modifier.weight(1f))
-                        Switch(
-                            checked = ui.config.enabled,
-                            onCheckedChange = viewModel::setEnabled,
-                        )
+                        Switch(checked = ui.config.enabled, onCheckedChange = viewModel::setEnabled)
                         Spacer(Modifier.width(8.dp))
                         Button(onClick = { pickFolder.launch(null) }, modifier = Modifier.widthIn(min = 100.dp)) {
                             Text(stringResource(R.string.select_path))
                         }
                     }
                     Spacer(Modifier.height(6.dp))
-                    Text(
-                        "${stringResource(R.string.current_path)}: ${ui.config.path}",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
+                    Text("${stringResource(R.string.current_path)}: ${ui.config.path}", style = MaterialTheme.typography.bodySmall)
+                    Text(stringResource(R.string.receiver_state_text, receiver.phase.name, receiver.reason),
+                        style = MaterialTheme.typography.bodySmall)
+                    Text(stringResource(R.string.receiver_session_limits), style = MaterialTheme.typography.bodySmall)
                 }
             }
 
@@ -140,15 +138,10 @@ fun DropScreen(viewModel: DropViewModel = hiltViewModel()) {
             ElevatedCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp).fillMaxWidth()) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            stringResource(R.string.conflict_behavior),
-                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
-                        )
+                        Text(stringResource(R.string.conflict_behavior),
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold))
                         Spacer(Modifier.weight(1f))
-                        ConflictDropdown(
-                            current = ui.config.conflict,
-                            onSelect = viewModel::setConflict,
-                        )
+                        ConflictDropdown(current = ui.config.conflict, onSelect = viewModel::setConflict)
                     }
                 }
             }
@@ -157,43 +150,28 @@ fun DropScreen(viewModel: DropViewModel = hiltViewModel()) {
             ElevatedCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp).fillMaxWidth()) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            "Ping",
-                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
-                        )
+                        Text("Ping", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold))
                         Spacer(Modifier.width(8.dp))
                         OutlinedTextField(
-                            value = ui.pingAddress,
-                            onValueChange = viewModel::setPingAddress,
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
+                            value = ui.pingAddress, onValueChange = viewModel::setPingAddress,
+                            modifier = Modifier.weight(1f), singleLine = true,
                             placeholder = { Text(stringResource(R.string.ping_placeholder)) },
                             shape = RoundedCornerShape(12.dp),
                         )
                         Spacer(Modifier.width(8.dp))
-                        Button(
-                            onClick = viewModel::startPing,
-                            enabled = ui.tailscaleState is BackendState.Running,
-                            modifier = Modifier.widthIn(min = 80.dp),
-                        ) { Text(stringResource(R.string.test)) }
+                        Button(onClick = viewModel::startPing, enabled = ui.tailscaleState is BackendState.Running,
+                            modifier = Modifier.widthIn(min = 80.dp)) { Text(stringResource(R.string.test)) }
                     }
                 }
             }
 
-            // 4. Fix duplicate processes
+            // 4. Explicit, identity-checked legacy-loop cleanup. Never pkill every tailscale client.
             ElevatedCard(Modifier.fillMaxWidth()) {
-                Row(
-                    Modifier.padding(16.dp).fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        stringResource(R.string.fix_duplicate_file),
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
-                    )
+                Row(Modifier.padding(16.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(stringResource(R.string.receiver_legacy_title),
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold))
                     Spacer(Modifier.weight(1f))
-                    Button(onClick = viewModel::openKillDialog) {
-                        Text(stringResource(R.string.execute))
-                    }
+                    Button(onClick = viewModel::openKillDialog) { Text(stringResource(R.string.execute)) }
                 }
             }
 
@@ -202,25 +180,15 @@ fun DropScreen(viewModel: DropViewModel = hiltViewModel()) {
                 Column(Modifier.padding(16.dp).fillMaxWidth()) {
                     Text("${stringResource(R.string.daemon_output)}:", style = MaterialTheme.typography.titleSmall)
                     Spacer(Modifier.height(6.dp))
-                    Box(
-                        Modifier
-                            .fillMaxWidth()
-                            .height(180.dp)
-                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp))
-                            .padding(8.dp)
-                            .verticalScroll(rememberScrollState()),
-                    ) {
+                    Box(Modifier.fillMaxWidth().height(180.dp)
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp))
+                        .padding(8.dp).verticalScroll(rememberScrollState())) {
                         Text(daemonOutput.ifBlank { "—" }, style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
-
-            Text(
-                stringResource(R.string.tip),
-                style = MaterialTheme.typography.bodySmall,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-            )
+            Text(stringResource(R.string.tip), style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
         }
     }
 
@@ -229,12 +197,7 @@ fun DropScreen(viewModel: DropViewModel = hiltViewModel()) {
             onDismissRequest = viewModel::closePingDialog,
             title = { Text("Ping ${stringResource(R.string.test)}") },
             text = {
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .height(220.dp)
-                        .verticalScroll(rememberScrollState()),
-                ) { Text(ui.pingOutput) }
+                Box(Modifier.fillMaxWidth().height(220.dp).verticalScroll(rememberScrollState())) { Text(ui.pingOutput) }
             },
             confirmButton = {
                 Button(onClick = if (ui.isPinging) viewModel::stopPing else viewModel::closePingDialog) {
@@ -243,45 +206,20 @@ fun DropScreen(viewModel: DropViewModel = hiltViewModel()) {
             },
         )
     }
-
-    if (ui.killDialogOpen) {
-        val (titleRes, textRes) = when {
-            ui.processCount == 0 -> R.string.oops to R.string.no_tail_process
-            ui.processCount in 1..2 -> R.string.kill_process to R.string.only_one_process
-            else -> R.string.kill_process to R.string.multi_process
-        }
-        AlertDialog(
-            onDismissRequest = viewModel::dismissKillDialog,
-            title = { Text(stringResource(titleRes)) },
-            text = { Text(stringResource(textRes)) },
-            confirmButton = {
-                TextButton(
-                    onClick = if (ui.processCount == 0) viewModel::dismissKillDialog else viewModel::confirmKillProcesses,
-                ) { Text(stringResource(if (ui.processCount == 0) R.string.done else R.string.confirm)) }
-            },
-            dismissButton = if (ui.processCount > 0) {
-                { TextButton(onClick = viewModel::dismissKillDialog) { Text(stringResource(R.string.cancel)) } }
-            } else null,
-        )
-    }
+    ReceiverSafetyDialogs(ui, viewModel)
 }
 
 @Composable
-private fun ConflictDropdown(
-    current: ConflictBehavior,
-    onSelect: (ConflictBehavior) -> Unit,
-) {
+private fun ConflictDropdown(current: ConflictBehavior, onSelect: (ConflictBehavior) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     val context = LocalContext.current
     Box {
         Button(onClick = { expanded = true }, modifier = Modifier.widthIn(min = 100.dp)) {
-            Text(
-                when (current) {
-                    ConflictBehavior.Rename -> stringResource(R.string.rename)
-                    ConflictBehavior.Skip -> stringResource(R.string.skip)
-                    ConflictBehavior.Overwrite -> stringResource(R.string.overwrite)
-                },
-            )
+            Text(when (current) {
+                ConflictBehavior.Rename -> stringResource(R.string.rename)
+                ConflictBehavior.Skip -> stringResource(R.string.skip)
+                ConflictBehavior.Overwrite -> stringResource(R.string.overwrite)
+            })
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             ConflictBehavior.entries.forEach { value ->
@@ -290,18 +228,10 @@ private fun ConflictDropdown(
                     ConflictBehavior.Skip -> stringResource(R.string.skip)
                     ConflictBehavior.Overwrite -> stringResource(R.string.overwrite)
                 }
-                DropdownMenuItem(
-                    text = { Text(label) },
-                    onClick = {
-                        onSelect(value)
-                        expanded = false
-                        Toast.makeText(
-                            context,
-                            "${context.getString(R.string.conflict_behavior_set_to)}: $label",
-                            Toast.LENGTH_SHORT,
-                        ).show()
-                    },
-                )
+                DropdownMenuItem(text = { Text(label) }, onClick = {
+                    onSelect(value); expanded = false
+                    Toast.makeText(context, "${context.getString(R.string.conflict_behavior_set_to)}: $label", Toast.LENGTH_SHORT).show()
+                })
             }
         }
     }

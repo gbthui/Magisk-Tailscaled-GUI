@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="receiver_attention">接收已暂停：%1$s。请打开应用检查。</string>
+    <string name="receiver_unconfirmed">无法确认接收器状态：%1$s。不会因此增启另一个接收器。</string>
+    <string name="receiver_timed_out">Android 已结束本次接收会话，正在停止 root 接收器。请打开应用后恢复；这不是无限期后台守护。</string>
+    <string name="receiver_resume_failed">接收器所有者已变化或仍在运行，请刷新状态后再恢复。</string>
+    <string name="receiver_open_app_to_resume">接收需要检查，请打开 TailControl 并在应用中确认恢复。</string>
+    <string name="receiver_cleanup_incomplete">部分接收器身份已变化或尚未退出。没有终止无关进程，请查看日志并刷新。</string>
+    <string name="receiver_resume_title">恢复前请检查</string>
+    <string name="receiver_resume_warning">上一批接收失败或被中断，文件可能已经写入，但收件箱条目仍在。请先检查接收目录、收件箱及日志；恢复后可能再产生一份副本。应用不会自动删除文件或按哈希去重。选择 skip 策略时，同名冲突也会暂停接收，等待检查。</string>
+    <string name="receiver_resume_confirm">已检查，恢复接收</string>
+    <string name="receiver_legacy_title">检查旧接收循环</string>
+    <string name="receiver_no_legacy">没有发现符合条件的旧版默认 socket 接收循环。单次接收、发送、Ping 和登录任务不在清理范围内。</string>
+    <string name="receiver_legacy_warning">停止这些旧版或手工启动的模块接收循环吗？PID：%1$s。执行前会再次核验 boot ID、启动时间、UID、可执行文件与参数。不会删除文件，也不会停止发送、Ping 或登录任务。</string>
+    <string name="receiver_state_text">root 接收器：%1$s · %2$s</string>
+    <string name="receiver_session_limits">接收错误会暂停自动处理，等待检查。Android 15+ 限制后台数据同步会话时长，开机后不会自动恢复此类会话。</string>
+    <string name="receiver_boot_paused">Android 15+ 不允许在开机广播中恢复此类数据同步会话。请打开 TailControl 后开启接收。</string>
+</resources>

@@ -1,6 +1,5 @@
 package top.cenmin.tailcontrol.service
 
-import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -9,212 +8,168 @@ import android.content.Intent
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import timber.log.Timber
 import top.cenmin.tailcontrol.MainActivity
 import top.cenmin.tailcontrol.R
 import top.cenmin.tailcontrol.core.data.DropRepository
 import top.cenmin.tailcontrol.core.data.PreferencesRepository
-import top.cenmin.tailcontrol.core.data.TailscaleRepository
-import top.cenmin.tailcontrol.core.model.BackendState
-import top.cenmin.tailcontrol.core.model.ConflictBehavior
+import top.cenmin.tailcontrol.core.model.DropRequest
+import top.cenmin.tailcontrol.core.model.ReceiverPhase
 import javax.inject.Inject
 
+/** A bounded Android observer/controller. The root owner supplies the lock and expiring lease. */
 @AndroidEntryPoint
 class DropProtectService : Service() {
-
     companion object {
         const val CHANNEL_ID = "TAILCONTROL_DROP_PROTECT"
         const val NOTIFICATION_ID = 3001
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
+        // Retained for old callers. Configuration is always read from the latest revision.
         const val EXTRA_PATH = "EXTRA_PATH"
         const val EXTRA_BEHAVIOR = "EXTRA_BEHAVIOR"
+        @Volatile var controllerActive = false
+            private set
     }
 
     @Inject lateinit var prefs: PreferencesRepository
     @Inject lateinit var dropRepo: DropRepository
-    @Inject lateinit var tailRepo: TailscaleRepository
-
+    @Inject lateinit var sessionGuard: ReceiverSessionGuard
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var loopJob: Job? = null
+    private val wake = Channel<Unit>(Channel.CONFLATED)
+    @Volatile private var latestStartId = 0
+    @Volatile private var timedOut = false
+    @Volatile private var lastRequest: DropRequest? = null
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        controllerActive = true
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.createNotificationChannel(NotificationChannel(CHANNEL_ID,
+            "TailControl ${getString(R.string.drop_label)}", NotificationManager.IMPORTANCE_LOW))
+        // Exactly one consumer performs start/stop/reconfigure. No separate cleanup launch can race it.
+        scope.launch {
+            for (ignored in wake) {
+                if (timedOut) break
+                val requestId = latestStartId
+                if (requestId == 0) continue
+                try {
+                    val request = prefs.dropRequest.first()
+                    lastRequest = request
+                    val observed = if (request.config.enabled) dropRepo.ensureRunning(request.config)
+                        else dropRepo.stopFileGet()
+                    when (observed.phase) {
+                        ReceiverPhase.PAUSED, ReceiverPhase.BLOCKED -> {
+                            if (request.config.enabled) prefs.disableDropIfRevision(request.revision)
+                            showStatus(getString(R.string.receiver_attention, observed.reason))
+                            ReceiverNotice.show(this@DropProtectService, getString(R.string.receiver_attention, observed.reason))
+                        }
+                        ReceiverPhase.RUNNING -> {
+                            showStatus(getString(R.string.Daemon_running))
+                            ReceiverNotice.clear(this@DropProtectService)
+                        }
+                        ReceiverPhase.UNKNOWN -> showStatus(getString(R.string.receiver_unconfirmed, observed.reason))
+                        ReceiverPhase.STARTING, ReceiverPhase.STOPPING -> showStatus(getString(R.string.loading))
+                        ReceiverPhase.STOPPED -> Unit
+                    }
+                    val latest = prefs.dropRequest.first()
+                    if (!latest.config.enabled && (observed.quiescent || observed.phase == ReceiverPhase.BLOCKED)) {
+                        // The UI's enabled flag is user intent; do not report stopped for UNKNOWN.
+                        withContext(Dispatchers.Main) {
+                            if (!timedOut && latestStartId == requestId) {
+                                if (stopSelfResult(requestId)) stopForeground(STOP_FOREGROUND_REMOVE)
+                            }
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    dropRepo.appendLog("Receiver control failed: ${e.message}")
+                    Timber.e(e, "receiver control failure")
+                    // No new consumer on an exception. Without successful renewal, the root lease expires.
+                }
+            }
+        }
+        scope.launch { prefs.dropRequest.distinctUntilChanged().collect { wake.trySend(Unit) } }
+        scope.launch { while (isActive) { delay(3000); wake.trySend(Unit) } }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> {
-                val path = intent.getStringExtra(EXTRA_PATH)
-                val behavior = ConflictBehavior.fromCli(intent.getStringExtra(EXTRA_BEHAVIOR))
-                startProtect(path, behavior)
-            }
-            ACTION_STOP -> stopProtect()
-            else -> {
-                // Restart from boot or system: read prefs.
-                scope.launch {
-                    val cfg = prefs.dropConfig.first()
-                    if (cfg.enabled) startProtect(cfg.path, cfg.conflict)
-                    else stopProtect()
-                }
-            }
+        latestStartId = startId
+        if (timedOut) { stopSelf(startId); return START_NOT_STICKY }
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.loading)))
+            wake.trySend(Unit)
+        } catch (e: Exception) {
+            dropRepo.appendLog("Cannot enter foreground: ${e.message}")
+            finishForSystemLimit()
         }
-        return START_STICKY
+        // Do not evade dataSync time limits by repeatedly resurrecting this service.
+        return START_NOT_STICKY
     }
 
-    @SuppressLint("SdCardPath")
-    private fun startProtect(pathArg: String?, behavior: ConflictBehavior) {
-        val path = pathArg ?: "/sdcard/Download/TailDrop/"
-        // 检查目录是否存在
-        if (!ensureDirectoryExists(path)) {
-            dropRepo.appendLog(getString(R.string.drop_start_failed_dir_invalid, path))
-            updateNotification(getString(R.string.drop_failed_dir_invalid))
-            stopProtect()
-            return
-        }
-        loopJob?.cancel()
+    override fun onTimeout(startId: Int, fgsType: Int) { finishForSystemLimit() }
 
-        startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.loading)))
-
-        loopJob = scope.launch {
-            val status = tailRepo.fetchStatus()
-            val running = status.backendState is BackendState.Running
-            dropRepo.appendLog(getString(R.string.status) + ": " + getString(status.backendState.labelRes))
-            if (!running) {
-                dropRepo.appendLog(getString(R.string.drop_stop_due_to_tail))
-                dropRepo.stopFileGet()
-                @Suppress("DEPRECATION") stopForeground(true)
-                return@launch
-            }
-            updateNotification(getString(R.string.Daemon_running))
-
-            // Sanity: kill bloated tailscale forks
-            val n = tailRepo.pgrepTailscaleCount()
-            if (n >= 5) {
-                tailRepo.killAllTailscale()
-                Timber.d("[drop] too many tailscale forks (%d), pkill", n)
-            }
-
-            while (isActive) {
-                runCatching {
-                    val (storedPath, storedBehavior, pid) = prefs.loadDropRuntime()
-                    val needRestart = storedPath != path || storedBehavior != behavior
-                    if (needRestart) dropRepo.stopFileGet()
-                    val alive = pid != null && pid > 0 && dropRepo.isProcessAlive(pid)
-                    if (!alive) {
-                        val realPid = dropRepo.startFileGet(path, behavior)
-                        if (realPid != null) {
-                            dropRepo.appendLog(
-                                getString(R.string.msg_file_get_success, realPid, realPid),
-                            )
-                        } else {
-                            dropRepo.appendLog(getString(R.string.msg_file_get_failed_no_ppid))
-                        }
-                    }
-                }.onFailure {
-                    dropRepo.appendLog(getString(R.string.msg_file_get_unexpected, it.message.orEmpty()))
-                    Timber.e(it, "drop loop failure")
-                }
-                delay(3000)
-            }
-        }
-    }
-
-    private fun stopProtect() {
-        loopJob?.cancel()
-        loopJob = null
-        scope.launch { dropRepo.stopFileGet() }
-        @Suppress("DEPRECATION") stopForeground(true)
+    private fun finishForSystemLimit() {
+        timedOut = true
+        val generation = dropRepo.status.value.generation
+        val revision = lastRequest?.revision
+        scope.cancel() // Stop issuing renewals immediately, even if su is currently unavailable.
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        runCatching { sessionGuard.block(revision) }
+            .onFailure { Timber.e(it, "Unable to persist receiver system-stop marker") }
+        dropRepo.appendLog(getString(R.string.receiver_timed_out))
+        ReceiverNotice.show(this, getString(R.string.receiver_timed_out))
+        // Not in the service's cancelled scope. Generation and revision fence stale cleanup.
+        val cleanup = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        cleanup.launch {
+            try {
+                if (revision != null) prefs.disableDropIfRevision(revision)
+                dropRepo.requestStop(generation)
+            } finally { cleanup.cancel() }
+        }
+        // stopSelf was already called before any persistence or root cleanup work.
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        controllerActive = false
         scope.cancel()
-    }
-
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        // 应用主任务被滑掉时，如果用户开启了 drop，让前台服务继续；否则直接结束。
-        runBlocking {
-            val enabled = prefs.dropConfig.first().enabled
-            if (!enabled) stopProtect()
-        }
-        super.onTaskRemoved(rootIntent)
+        wake.close()
+        // Unexpected process/service destruction stops renewals. Root cleanup has a 20s lease bound.
+        super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun createNotificationChannel() {
-        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        val ch = NotificationChannel(
-            CHANNEL_ID,
-            "TailControl ${getString(R.string.drop_label)}",
-            NotificationManager.IMPORTANCE_LOW,
-        )
-        nm.createNotificationChannel(ch)
-    }
-
     private fun buildNotification(text: String): android.app.Notification {
         val intent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra("show_drop_screen", true)
         }
-        val pi = PendingIntent.getActivity(
-            this, 0, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+        val pi = PendingIntent.getActivity(this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
-            .setContentTitle("TailControl Drop")
-            .setContentText(text)
-            .setOngoing(true)
-            .setContentIntent(pi)
-            .build()
+            .setContentTitle("TailControl Drop").setContentText(text)
+            .setOngoing(true).setContentIntent(pi).build()
     }
 
-    private fun updateNotification(text: String) {
+    private fun showStatus(text: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIFICATION_ID, buildNotification(text))
-    }
-
-    private fun ensureDirectoryExists(path: String): Boolean {
-        return try {
-            val dir = java.io.File(path)
-            if (!dir.exists()) {
-                val created = dir.mkdirs()
-                if (created) {
-                    dropRepo.appendLog(getString(R.string.dir_created, path))
-                    Timber.d("Directory created: $path")
-                    runBlocking {
-                        delay(500)
-                    }
-                } else {
-                    dropRepo.appendLog(getString(R.string.dir_create_failed, path))
-                    Timber.e("Failed to create directory: $path")
-                }
-                created
-            } else {
-                true
-            }
-        } catch (e: SecurityException) {
-            dropRepo.appendLog(getString(R.string.dir_create_permission_denied, path, e.message.orEmpty()))
-            Timber.e(e, "Permission denied to create directory: $path")
-            false
-        } catch (e: Exception) {
-            dropRepo.appendLog(getString(R.string.dir_create_error, path, e.message.orEmpty()))
-            Timber.e(e, "Error creating directory: $path")
-            false
-        }
     }
 }
