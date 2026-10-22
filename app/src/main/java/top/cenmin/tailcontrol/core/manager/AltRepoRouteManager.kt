@@ -1,6 +1,9 @@
 package top.cenmin.tailcontrol.core.manager
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import top.cenmin.tailcontrol.core.data.TailscaleRepository
+import top.cenmin.tailcontrol.core.shell.CommandResult
 import top.cenmin.tailcontrol.core.shell.RootShell
 import top.cenmin.tailcontrol.core.shell.ShellCommand
 import javax.inject.Inject
@@ -8,96 +11,101 @@ import javax.inject.Singleton
 
 /** Manages marked route blocks in the optional AltRepo TUN scripts. */
 @Singleton
-class AltRepoRouteManager @Inject constructor(
-    private val shell: RootShell,
-    private val tailscaleRepository: TailscaleRepository,
+class AltRepoRouteManager internal constructor(
+    private val exec: suspend (String) -> CommandResult,
+    private val available: suspend () -> Boolean,
+    private val tun: suspend (String) -> CommandResult,
+    private val primaryRoutes: suspend () -> List<String>,
+    scriptsDir: String = "/data/adb/tailscale/scripts",
 ) {
+    @Inject constructor(shell: RootShell, repo: TailscaleRepository) : this(
+        shell::exec, repo::hasTunScript, repo::runTun,
+        { val status = repo.fetchStatus(); status.peers.flatMap { it.primaryRoutes } + (status.self?.primaryRoutes ?: emptyList()) },
+    )
+
+    private val lifecycle = Mutex()
+    private val tunUp = "$scriptsDir/tailscaled.tun.up"
+    private val tunDown = "$scriptsDir/tailscaled.tun.down"
+    private val tunUpBackup = "$tunUp.bak"
+    private val tunDownBackup = "$tunDown.bak"
     companion object {
-        private const val SCRIPTS_DIR = "/data/adb/tailscale/scripts"
-        private const val TUN_UP = "$SCRIPTS_DIR/tailscaled.tun.up"
-        private const val TUN_DOWN = "$SCRIPTS_DIR/tailscaled.tun.down"
-        private const val TUN_UP_BAK = "$TUN_UP.bak"
-        private const val TUN_DOWN_BAK = "$TUN_DOWN.bak"
         private const val BLOCK_BEGIN = "# --- TailControl managed routes begin ---"
         private const val BLOCK_END = "# --- TailControl managed routes end ---"
     }
 
-    suspend fun isAvailable(): Boolean = tailscaleRepository.hasTunScript()
-
+    suspend fun isAvailable(): Boolean = available()
     private fun unavailable() = SyncResult(false,
         "tailscaled.tun is unavailable. This feature requires an AltRepo-compatible module; no scripts were changed.")
 
-    suspend fun syncRoutes(): SyncResult {
-        // Check BEFORE creating, backing up, or editing any scripts.
-        if (!isAvailable()) return unavailable()
-        val status = tailscaleRepository.fetchStatus()
-        val routes = (status.peers.flatMap { it.primaryRoutes } + (status.self?.primaryRoutes ?: emptyList()))
-            .filter { it.isNotBlank() }.distinct().sorted()
-        if (routes.isEmpty()) return SyncResult(false, "No primary routes found in tailscale status.")
-
-        if (!ensureFileExists(TUN_UP) || !ensureFileExists(TUN_DOWN) ||
-            !backupIfAbsent(TUN_UP, TUN_UP_BAK) || !backupIfAbsent(TUN_DOWN, TUN_DOWN_BAK)) {
-            return SyncResult(false, "Unable to prepare or back up TUN scripts; routes were not changed.")
+    suspend fun syncRoutes(): SyncResult = lifecycle.withLock {
+        if (!isAvailable()) return@withLock unavailable()
+        val routes = primaryRoutes().filter { it.isNotBlank() }.distinct().sorted()
+        if (routes.isEmpty()) return@withLock SyncResult(false, "No primary routes found in tailscale status.")
+        if (!ensureFileExists(tunUp) || !ensureFileExists(tunDown) ||
+            !backupIfAbsent(tunUp, tunUpBackup) || !backupIfAbsent(tunDown, tunDownBackup)) {
+            return@withLock SyncResult(false, "Unable to prepare or back up TUN scripts; routes were not changed.")
         }
-        val stopped = tailscaleRepository.runTun("stop")
-        if (!stopped.ok) return SyncResult(false, "TUN stop failed; scripts were not edited: ${stopped.text}")
-        val up = injectBlock(TUN_UP, buildUpBlock(routes))
-        val down = injectBlock(TUN_DOWN, buildDownBlock(routes))
-        val started = tailscaleRepository.runTun("start")
-        return SyncResult(up.ok && down.ok && started.ok,
-            "Routes: ${routes.joinToString(", ")}\ntun.up: ${up.message.ifBlank { "OK" }}\n" +
-                "tun.down: ${down.message.ifBlank { "OK" }}\ntun start: ${if (started.ok) "OK" else started.text}", routes)
+        val stopped = tun("stop")
+        if (!stopped.ok) return@withLock SyncResult(false, "TUN stop failed; scripts were not edited: ${stopped.text}")
+        val up = rewriteBlock(tunUp, buildBlock(routes, add = true))
+        val down = rewriteBlock(tunDown, buildBlock(routes, add = false))
+        finishEdits(up, down, stopped, routes)
     }
 
-    suspend fun restoreBackup(): SyncResult {
-        if (!isAvailable()) return unavailable()
-        val upExists = fileExists(TUN_UP_BAK)
-        val downExists = fileExists(TUN_DOWN_BAK)
-        if (!upExists && !downExists) return SyncResult(false, "No backup files found. Nothing to restore.")
-        val stopped = tailscaleRepository.runTun("stop")
-        if (!stopped.ok) return SyncResult(false, "TUN stop failed; backup was not restored: ${stopped.text}")
-        val messages = mutableListOf<String>()
-        var ok = true
-        for ((exists, backup, target) in listOf(Triple(upExists, TUN_UP_BAK, TUN_UP), Triple(downExists, TUN_DOWN_BAK, TUN_DOWN))) {
-            if (exists) {
-                val restored = shell.exec(ShellCommand.argv("cp", "-f", backup, target))
-                ok = ok && restored.ok
-                messages += "$target: ${if (restored.ok) "restored" else restored.text}"
-            }
+    suspend fun restoreBackup(): SyncResult = lifecycle.withLock {
+        if (!isAvailable()) return@withLock unavailable()
+        // A single backup cannot restore a consistent up/down pair.
+        if (!fileExists(tunUpBackup) || !fileExists(tunDownBackup)) {
+            return@withLock SyncResult(false, "Both TUN backup files are required. Nothing was restored.")
         }
-        val started = tailscaleRepository.runTun("start")
+        val stopped = tun("stop")
+        if (!stopped.ok) return@withLock SyncResult(false, "TUN stop failed; backup was not restored: ${stopped.text}")
+        val up = exec(ShellCommand.argv("cp", "-f", tunUpBackup, tunUp))
+        val down = exec(ShellCommand.argv("cp", "-f", tunDownBackup, tunDown))
+        finishEdits(up, down, stopped)
+    }
+
+    suspend fun removeRoutes(): SyncResult = lifecycle.withLock {
+        // On-disk cleanup is independent of executable discovery. In particular, a removed
+        // optional module must not leave our injected blocks waiting to run when it returns.
+        val stopped = if (isAvailable()) tun("stop") else CommandResult.failure(
+            "tailscaled.tun is unavailable; active routes/firewall cleanup cannot be confirmed", 127)
+        val up = rewriteBlock(tunUp, null)
+        val down = rewriteBlock(tunDown, null)
+        finishEdits(up, down, stopped)
+    }
+
+    private suspend fun finishEdits(up: CommandResult, down: CommandResult, stopped: CommandResult,
+                                   routes: List<String> = emptyList()): SyncResult {
+        val messages = mutableListOf(
+            "tun stop: ${if (stopped.ok) "OK" else stopped.text}",
+            "tun.up: ${if (up.ok) "OK" else up.text}",
+            "tun.down: ${if (down.ok) "OK" else down.text}",
+        )
+        // Never restart an inconsistent pair, including a partial restore or block removal.
+        if (!up.ok || !down.ok || !stopped.ok) {
+            messages += if (stopped.ok) "TUN remains stopped. Repair/restore both scripts before reconnecting."
+                else "TUN was not restarted. Owned blocks were cleaned where possible, but active network rules may remain."
+            return SyncResult(false, messages.joinToString("\n"), routes, scriptsUpdated = up.ok && down.ok)
+        }
+        val started = tun("start")
         messages += "tun start: ${if (started.ok) "OK" else started.text}"
-        return SyncResult(ok && started.ok, messages.joinToString("\n"))
+        return SyncResult(started.ok, messages.joinToString("\n"), routes, scriptsUpdated = true)
     }
 
-    suspend fun removeRoutes(): SyncResult {
-        if (!isAvailable()) return unavailable()
-        val stopped = tailscaleRepository.runTun("stop")
-        if (!stopped.ok) return SyncResult(false, "TUN stop failed; scripts were not edited: ${stopped.text}")
-        val up = removeBlock(TUN_UP)
-        val down = removeBlock(TUN_DOWN)
-        val started = tailscaleRepository.runTun("start")
-        return SyncResult(up.ok && down.ok && started.ok,
-            "tun.up: ${up.message.ifBlank { "cleaned" }}\ntun.down: ${down.message.ifBlank { "cleaned" }}\n" +
-                "tun start: ${if (started.ok) "OK" else started.text}")
-    }
-
-    suspend fun hasBackup(): Boolean = fileExists(TUN_UP_BAK) || fileExists(TUN_DOWN_BAK)
-
-    private suspend fun fileExists(path: String): Boolean = shell.exec("[ -f ${ShellCommand.quote(path)} ]").ok
-
+    suspend fun hasBackup(): Boolean = fileExists(tunUpBackup) || fileExists(tunDownBackup)
+    private suspend fun fileExists(path: String): Boolean = exec("[ -f ${ShellCommand.quote(path)} ]").ok
     private suspend fun ensureFileExists(path: String): Boolean = fileExists(path) ||
-        shell.exec("printf '%s' ${ShellCommand.quote("#!/system/bin/sh\n")} > ${ShellCommand.quote(path)} && chmod 755 ${ShellCommand.quote(path)}").ok
+        exec("printf '%s' ${ShellCommand.quote("#!/system/bin/sh\n")} > ${ShellCommand.quote(path)} && chmod 755 ${ShellCommand.quote(path)}").ok
+    private suspend fun backupIfAbsent(src: String, bak: String): Boolean = fileExists(bak) || exec(ShellCommand.argv("cp", src, bak)).ok
 
-    private suspend fun backupIfAbsent(src: String, bak: String): Boolean = fileExists(bak) ||
-        shell.exec(ShellCommand.argv("cp", src, bak)).ok
-
-    private suspend fun removeBlock(path: String): InjectResult = rewriteBlock(path, null)
-    private suspend fun injectBlock(path: String, block: String): InjectResult = rewriteBlock(path, block)
-
-    /** Root-owned, same-directory temporary files avoid shared /data/local/tmp names and allow atomic mv. */
-    private suspend fun rewriteBlock(path: String, block: String?): InjectResult {
-        if (block == null && !fileExists(path)) return InjectResult(true)
+    /** Root-owned, same-directory temporary files allow atomic replacement of each script. */
+    private suspend fun rewriteBlock(path: String, block: String?): CommandResult {
+        if (block == null) {
+            // Test absence separately from read failure. Do not turn denied/unreadable files into success.
+            val absent = exec("[ ! -e ${ShellCommand.quote(path)} ] && [ ! -L ${ShellCommand.quote(path)} ]")
+            if (absent.ok) return CommandResult(true, 0, emptyList(), emptyList())
+        }
         val awk = "/^# --- TailControl managed routes begin ---/{skip=1;next} /^# --- TailControl managed routes end ---/{skip=0;next} !skip{print}"
         val append = if (block == null) "" else "printf '%s\\n' ${ShellCommand.quote(block)} >> \"\$tmp\" || exit 1"
         val command = """
@@ -107,34 +115,26 @@ class AltRepoRouteManager @Inject constructor(
             $append
             chmod 755 "${'$'}tmp" && mv -f "${'$'}tmp" ${ShellCommand.quote(path)}
         """.trimIndent()
-        val r = shell.exec(command)
-        return InjectResult(r.ok, if (r.ok) "" else r.text.ifBlank { "Script update failed (${r.code})" })
+        return exec(command)
     }
 
-    private fun buildUpBlock(routes: List<String>): String = buildString {
+    private fun buildBlock(routes: List<String>, add: Boolean): String = buildString {
         appendLine(BLOCK_BEGIN)
         for (route in routes) {
             val target = ShellCommand.quote(route)
             val ip = if (':' in route) "ip -6" else "ip"
             val firewall = if (':' in route) "ip6tables" else "iptables"
-            appendLine("$ip route add $target dev tailscale0 metric 1 2>/dev/null || true")
-            appendLine("$firewall -t mangle -A OUTPUT -d $target -j MARK --set-mark 1099 2>/dev/null || true")
+            if (add) {
+                appendLine("$ip route add $target dev tailscale0 metric 1 2>/dev/null || true")
+                appendLine("$firewall -t mangle -A OUTPUT -d $target -j MARK --set-mark 1099 2>/dev/null || true")
+            } else {
+                appendLine("$ip route del $target dev tailscale0 2>/dev/null || true")
+                appendLine("$firewall -t mangle -D OUTPUT -d $target -j MARK --set-mark 1099 2>/dev/null || true")
+            }
         }
         append(BLOCK_END)
     }
 
-    private fun buildDownBlock(routes: List<String>): String = buildString {
-        appendLine(BLOCK_BEGIN)
-        for (route in routes) {
-            val target = ShellCommand.quote(route)
-            val ip = if (':' in route) "ip -6" else "ip"
-            val firewall = if (':' in route) "ip6tables" else "iptables"
-            appendLine("$ip route del $target dev tailscale0 2>/dev/null || true")
-            appendLine("$firewall -t mangle -D OUTPUT -d $target -j MARK --set-mark 1099 2>/dev/null || true")
-        }
-        append(BLOCK_END)
-    }
-
-    data class SyncResult(val ok: Boolean, val message: String = "", val routes: List<String> = emptyList())
-    private data class InjectResult(val ok: Boolean, val message: String = "")
+    data class SyncResult(val ok: Boolean, val message: String = "", val routes: List<String> = emptyList(),
+                          val scriptsUpdated: Boolean = false)
 }

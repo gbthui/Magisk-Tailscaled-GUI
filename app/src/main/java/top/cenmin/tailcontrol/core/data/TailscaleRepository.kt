@@ -12,6 +12,7 @@ import top.cenmin.tailcontrol.core.model.TailscaleStatusJson
 import top.cenmin.tailcontrol.core.model.WhoisInfo
 import top.cenmin.tailcontrol.core.model.toDevice
 import top.cenmin.tailcontrol.core.shell.CommandResult
+import top.cenmin.tailcontrol.core.shell.DisconnectCommands
 import top.cenmin.tailcontrol.core.shell.RootShell
 import top.cenmin.tailcontrol.core.shell.ShellCommand
 import javax.inject.Inject
@@ -72,16 +73,12 @@ class TailscaleRepository @Inject constructor(
         return shell.exec("tailscale up ${args.trim()}".trim())
     }
 
-    /** Disconnect even if an optional TUN script has disappeared; report failed cleanup. */
-    suspend fun down(): CommandResult {
-        val result = shell.exec("tailscale down")
-        if (!result.ok) return result
-        if (prefs.altRepoOptimizationEnabled.first()) {
-            val tun = runTun("stop")
-            if (!tun.ok) return CommandResult.failure("Tailscale disconnected, but TUN cleanup failed: ${tun.text}", tun.code)
-        }
-        return result
-    }
+    /** Always attempt enabled TUN cleanup, including when the daemon cannot accept down. */
+    suspend fun down(): CommandResult = DisconnectCommands.run(
+        cleanupEnabled = prefs.altRepoOptimizationEnabled.first(),
+        down = { shell.exec("tailscale down") },
+        cleanup = { runTun("stop") },
+    )
 
     suspend fun hasTunScript(): Boolean = shell.resolveExecutable("tailscaled.tun") != null
 

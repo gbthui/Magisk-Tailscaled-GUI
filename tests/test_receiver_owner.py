@@ -260,4 +260,49 @@ class OwnerTests(unittest.TestCase):
         (self.tmp/'mode').write_text('normal')
         self.start('two');self.wait_running()
 
+    def unpublished_stopping_session(self, expired=True, pending=False):
+        self.call('status')
+        session=self.root/'session-unpublished'; session.mkdir()
+        (self.root/'current').write_text('unpublished')
+        (session/'directory').write_text(str(self.dest))
+        (session/'policy').write_text('rename')
+        (session/'state').write_text('STOPPING')
+        (session/'stop').write_text('requested')
+        uptime=int(float(Path('/proc/uptime').read_text().split()[0]))
+        (session/'lease').write_text('0' if expired else str(uptime+20))
+        if pending: (session/'pending').write_text('batch-started')
+        return session
+    def test_unpublished_stopping_session_recovers_after_expired_lease(self):
+        self.unpublished_stopping_session()
+        self.assertEqual(self.status()[1],'STOPPED')
+        self.start('replacement'); self.wait_running()
+        self.assertEqual(self.status()[2],'replacement')
+    def test_unpublished_stopping_session_waits_for_lease(self):
+        self.unpublished_stopping_session(expired=False)
+        self.assertEqual(self.status()[1],'STOPPING')
+        self.assertEqual(self.start('other')[0].split('\t')[1],'STOPPING')
+    def test_unpublished_stopping_session_keeps_uncertain_batch_paused(self):
+        self.unpublished_stopping_session(pending=True)
+        self.assertEqual(self.status()[1],'PAUSED')
+        self.assertEqual(self.start('other')[0].split('\t')[1],'PAUSED')
+    def test_unpublished_stopping_session_cannot_ignore_held_inbox_lock(self):
+        self.unpublished_stopping_session()
+        p=subprocess.Popen(['/bin/sh','-c',
+            'exec 8>>"$1"; flock -n 8 8>&8 || exit 1; echo locked; exec sleep 60 8>&8',
+            'lock-holder',str(self.root/'inbox.lock')],stdout=subprocess.PIPE,text=True)
+        self.extra.append(p)
+        self.assertEqual(p.stdout.readline().strip(),'locked')
+        self.assertEqual(self.status()[1],'UNKNOWN')
+        self.assertEqual(self.start('other')[0].split('\t')[1],'UNKNOWN')
+        p.stdout.close()
+    def test_malformed_stopping_identity_stays_unknown_even_after_expiry(self):
+        session=self.unpublished_stopping_session()
+        (session/'supervisor').write_text('malformed')
+        self.assertEqual(self.status()[1],'UNKNOWN')
+    def test_late_unpublished_supervisor_cannot_run_after_stop(self):
+        session=self.unpublished_stopping_session()
+        self.call('supervise','unpublished')
+        self.assertEqual(self.status()[1],'STOPPED')
+        self.assertFalse((self.tmp/'calls').exists())
+
 if __name__=='__main__':unittest.main(verbosity=2)

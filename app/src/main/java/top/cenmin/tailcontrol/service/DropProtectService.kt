@@ -41,10 +41,13 @@ class DropProtectService : Service() {
         // Retained for old callers. Configuration is always read from the latest revision.
         const val EXTRA_PATH = "EXTRA_PATH"
         const val EXTRA_BEHAVIOR = "EXTRA_BEHAVIOR"
+        @Volatile var controllerActive = false
+            private set
     }
 
     @Inject lateinit var prefs: PreferencesRepository
     @Inject lateinit var dropRepo: DropRepository
+    @Inject lateinit var sessionGuard: ReceiverSessionGuard
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val wake = Channel<Unit>(Channel.CONFLATED)
     @Volatile private var latestStartId = 0
@@ -53,6 +56,7 @@ class DropProtectService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        controllerActive = true
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(NotificationChannel(CHANNEL_ID,
             "TailControl ${getString(R.string.drop_label)}", NotificationManager.IMPORTANCE_LOW))
@@ -124,6 +128,10 @@ class DropProtectService : Service() {
         val generation = dropRepo.status.value.generation
         val revision = lastRequest?.revision
         scope.cancel() // Stop issuing renewals immediately, even if su is currently unavailable.
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        runCatching { sessionGuard.block(revision) }
+            .onFailure { Timber.e(it, "Unable to persist receiver system-stop marker") }
         dropRepo.appendLog(getString(R.string.receiver_timed_out))
         ReceiverNotice.show(this, getString(R.string.receiver_timed_out))
         // Not in the service's cancelled scope. Generation and revision fence stale cleanup.
@@ -134,12 +142,11 @@ class DropProtectService : Service() {
                 dropRepo.requestStop(generation)
             } finally { cleanup.cancel() }
         }
-        // Never await su, a file copy, or DataStore before meeting Android's timeout deadline.
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        // stopSelf was already called before any persistence or root cleanup work.
     }
 
     override fun onDestroy() {
+        controllerActive = false
         scope.cancel()
         wake.close()
         // Unexpected process/service destruction stops renewals. Root cleanup has a 20s lease bound.
@@ -150,7 +157,7 @@ class DropProtectService : Service() {
 
     private fun buildNotification(text: String): android.app.Notification {
         val intent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra("show_drop_screen", true)
         }
         val pi = PendingIntent.getActivity(this, 0, intent,

@@ -27,6 +27,7 @@ import top.cenmin.tailcontrol.core.model.ConflictBehavior
 import top.cenmin.tailcontrol.core.model.DropConfig
 import top.cenmin.tailcontrol.core.model.LegacyReceiver
 import top.cenmin.tailcontrol.core.model.ReceiverPhase
+import top.cenmin.tailcontrol.service.ReceiverSessionGuard
 import top.cenmin.tailcontrol.service.DropProtectService
 import javax.inject.Inject
 
@@ -52,6 +53,7 @@ class DropViewModel @Inject constructor(
     private val prefs: PreferencesRepository,
     private val tailRepo: TailscaleRepository,
     private val dropRepo: DropRepository,
+    private val sessionGuard: ReceiverSessionGuard,
 ) : ViewModel() {
     private val _ui = MutableStateFlow(DropUiState())
     val ui: StateFlow<DropUiState> = _ui.asStateFlow()
@@ -100,6 +102,7 @@ class DropViewModel @Inject constructor(
                         return@launch
                     }
                 }
+                if (target) sessionGuard.allowExplicitStart()
                 prefs.setDropEnabled(target)
                 val request = prefs.dropRequest.first()
                 val intent = Intent(app, DropProtectService::class.java).apply {

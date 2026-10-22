@@ -151,10 +151,15 @@ status() {
     if [ "$code" = 0 ]; then
         report "$phase" "$VERIFIED_PID" "$(cat "$SESSION/reason" 2>/dev/null)"; return
     fi
-    if [ "$phase" = STARTING ] && [ ! -e "$SESSION/supervisor" ]; then
-        now; deadline=$(cat "$SESSION/lease" 2>/dev/null)
+    if { [ "$phase" = STARTING ] || [ "$phase" = STOPPING ]; } &&
+        [ ! -e "$SESSION/supervisor" ] && [ ! -L "$SESSION/supervisor" ]; then
+        # STOP may arrive before the detached supervisor publishes its identity. Absence is
+        # recoverable only after its startup lease expires AND the inbox lock below is free.
+        # An existing unreadable/malformed identity is deliberately not handled as absence.
+        now || { report UNKNOWN 0 clock-unavailable; return; }
+        deadline=$(cat "$SESSION/lease" 2>/dev/null)
         case "$deadline" in ''|*[!0-9]*) report UNKNOWN 0 missing-lease; return;; esac
-        if [ "$NOW" -le "$deadline" ]; then report STARTING 0 root-start-pending; return; fi
+        if [ "$NOW" -le "$deadline" ]; then report "$phase" 0 root-start-pending; return; fi
     elif [ "$code" = 2 ]; then
         report UNKNOWN 0 identity-unavailable; return
     fi
@@ -247,6 +252,11 @@ if [ "$ACTION" = supervise ]; then
     SESSION="$ROOT/session-$TOKEN"
     exec 8>>"$ROOT/inbox.lock"
     lock_fd 8 || { atomic "$SESSION/reason" inbox-lock-busy; state PAUSED; exit 75; }
+    # A delayed launch must not resurrect a stopped/replaced generation after recovery.
+    read_all "$ROOT/current" || exit 74
+    if [ "$VALUE" != "$TOKEN" ] || [ -e "$SESSION/stop" ]; then
+        state STOPPED; exit 0
+    fi
     record_identity $$ "$SESSION/supervisor" || exit 74
     # The old app's consumers do not respect this lock. Refuse to add another one.
     legacy=$(blockers)

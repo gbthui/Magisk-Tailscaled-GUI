@@ -21,6 +21,7 @@ import top.cenmin.tailcontrol.core.data.PreferencesRepository
 import top.cenmin.tailcontrol.core.data.TailscaleRepository
 import top.cenmin.tailcontrol.core.model.BackendState
 import top.cenmin.tailcontrol.core.model.ReceiverPhase
+import top.cenmin.tailcontrol.service.ReceiverSessionGuard
 import top.cenmin.tailcontrol.service.DropProtectService
 import javax.inject.Inject
 
@@ -29,6 +30,7 @@ class DropTileService : TileService() {
     @Inject lateinit var prefs: PreferencesRepository
     @Inject lateinit var tailRepo: TailscaleRepository
     @Inject lateinit var dropRepo: DropRepository
+    @Inject lateinit var sessionGuard: ReceiverSessionGuard
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     override fun onStartListening() {
@@ -57,6 +59,7 @@ class DropTileService : TileService() {
                     }
                 }
                 val target = prefs.toggleDropEnabled()
+                if (target) sessionGuard.allowExplicitStart()
                 val request = prefs.dropRequest.first()
                 val svc = Intent(this@DropTileService, DropProtectService::class.java).apply {
                     action = if (target) DropProtectService.ACTION_START else DropProtectService.ACTION_STOP

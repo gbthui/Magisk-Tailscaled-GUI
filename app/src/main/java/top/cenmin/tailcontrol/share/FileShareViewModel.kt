@@ -9,17 +9,16 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import top.cenmin.tailcontrol.R
 import top.cenmin.tailcontrol.core.data.TailscaleRepository
@@ -112,11 +111,9 @@ class FileShareViewModel @Inject constructor(
         val initialText = progressText(0, initial)
         _ui.update { it.copy(transferring = true, transferFinished = false,
             progressPercent = initial, progressText = initialText) }
-        transferJob = viewModelScope.launch(Dispatchers.IO) {
-            val sessionJob = currentCoroutineContext().job
-            UploadSessions.register(sessionJob)
+        var uploadId = 0L
+        val job = viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
             try {
-                pushNotification(initial, initialText)
                 val target = peer.ipv4 ?: peer.ipv6?.let { "[$it]" }
                     ?: peer.dnsName.trimEnd('.').ifBlank { peer.name }
                 val command = ShellCommand.fileSend(current.fileName, target)
@@ -131,21 +128,34 @@ class FileShareViewModel @Inject constructor(
                         lastUpdate = now; lastPercent = percent
                         val text = progressText(bytes, percent)
                         _ui.update { it.copy(progressPercent = percent, progressText = text) }
-                        pushNotification(percent, text)
+                        UploadSessions.update(uploadId, percent, text)
                     }
                 }
                 if (!result.ok) throw IOException(result.text.ifBlank { "CLI exited with code ${result.code}" })
                 _ui.update { it.copy(transferring = false, transferFinished = true, progressPercent = 100,
                     progressText = app.getString(R.string.transfer_complete_progress)) }
-                pushNotification(100, app.getString(R.string.transfer_complete))
+                UploadSessions.update(uploadId, 100, app.getString(R.string.transfer_complete))
             } catch (e: CancellationException) {
                 showFailure(e.message ?: app.getString(R.string.transfer_canceled))
                 throw e
             } catch (e: Exception) { showFailure(e.message ?: "Unable to transfer file") }
             finally {
-                UploadSessions.unregister(sessionJob)
-                if (_ui.value.progressPercent != 100) stopNotification()
+                UploadSessions.finish(uploadId)
             }
+        }
+        transferJob = job
+        uploadId = UploadSessions.register(job, initial, initialText)
+        try {
+            // send() is called by the visible activity's user action. Start once, BEFORE IO.
+            // Progress is observed by the existing service, never sent as another service launch.
+            app.startForegroundService(Intent(app, FileTransferService::class.java).apply {
+                action = FileTransferService.ACTION_START
+            })
+            job.start()
+        } catch (e: Exception) {
+            job.cancel()
+            UploadSessions.finish(uploadId)
+            showFailure(e.message ?: "Unable to start upload foreground service")
         }
     }
 
@@ -168,14 +178,9 @@ class FileShareViewModel @Inject constructor(
         }
     }
     fun dismissDoneDialog() { _ui.update { it.copy(doneDialog = false) } }
-    fun stopNotification() { app.stopService(Intent(app, FileTransferService::class.java)) }
-    private fun pushNotification(progress: Int, text: String) {
-        app.startForegroundService(Intent(app, FileTransferService::class.java).apply {
-            action = FileTransferService.ACTION_START
-            putExtra(FileTransferService.EXTRA_PROGRESS, progress)
-            putExtra(FileTransferService.EXTRA_CONTENT_TEXT, text)
-        })
-    }
+    // Kept for the activity's existing close hook. Each job removes its own progress entry;
+    // the service stops itself when all uploads finish, not when an older activity closes.
+    fun stopNotification() = Unit
     override fun onCleared() {
         transferJob?.cancel(); refreshJob?.cancel(); stopNotification(); super.onCleared()
     }
