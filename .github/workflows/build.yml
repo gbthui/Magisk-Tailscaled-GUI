@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "refactor/**" ]
   pull_request:
     branches: [ "master" ]
   workflow_dispatch:
@@ -12,49 +12,61 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
-      - name: 1. 拉取代码
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 2. 安装 JDK 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: 3. 赋予执行权限
-        run: chmod +x gradlew
-      
-      - name: 4. 修改配置文件（兼容 CI）
-        run: |
-          sed -i 's/kotlin = ".*"/kotlin = "2.0.21"/' gradle/libs.versions.toml
-          sed -i 's/ksp = ".*"/ksp = "2.0.21-1.0.28"/' gradle/libs.versions.toml
-          echo "android.disallowKotlinSourceSets=false" >> gradle.properties
-          
-      - name: 5. 解密签名文件
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install build SDK
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Decode release keystore (optional)
         env:
           ENCODED_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PATH: ${{ runner.temp }}/keystore.jks
         run: |
-          echo "$ENCODED_KEYSTORE" | base64 -d > "$KEYSTORE_PATH"
-          echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> $GITHUB_ENV
+          if [ -n "$ENCODED_KEYSTORE" ]; then
+            echo "$ENCODED_KEYSTORE" | base64 -d > "$KEYSTORE_PATH"
+            echo "STORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          fi
 
-      - name: 6. 打包并签名 Release APK
+      - name: Run unit tests and build release APKs
         run: |
-          ./gradlew clean --refresh-dependencies
-          ./gradlew assembleRelease
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest assembleRelease
         env:
-          STORE_FILE: ${{ env.KEYSTORE_PATH }}
           STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
-      - name: 7. 获取短 commit hash
-        id: vars
-        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      - name: Upload test reports and release APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apks-and-tests
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+            app/build/outputs/apk/release/*.apk
 
-      - name: 8. 创建/更新 Pre-release
+      - name: Get short commit hash
+        if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+        id: vars
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish pre-release
+        if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
         uses: ncipollo/release-action@v1
         with:
           tag: "latest-build"
@@ -65,38 +77,9 @@ jobs:
             - 构建时间: ${{ github.event.repository.updated_at }}
           artifacts: "app/build/outputs/apk/release/*.apk"
           prerelease: true
-          allowUpdates: true                     # 允许更新已有的 Release
-          omitBodyDuringUpdate: false            # 更新时保留新的 body
-          omitNameDuringUpdate: false            # 更新时更新名称
-          replacesArtifacts: true                # 替换旧的 APK
-          removeArtifacts: true 				
+          allowUpdates: true
+          omitBodyDuringUpdate: false
+          omitNameDuringUpdate: false
+          replacesArtifacts: true
+          removeArtifacts: true
           token: ${{ secrets.GITHUB_TOKEN }}
-      - name: 9. 推送到 Telegram
-        if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
-        env:
-          CHANNEL_ID: ${{ secrets.TELEGRAM_TO }}
-          BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          COMMIT_MESSAGE: |
-            **Github 自动构建**
-            
-            **版本:** ${{ steps.vars.outputs.short_sha }}
-            **提交:** ${{ github.event.head_commit.message }}
-            
-            [查看详情](${{ github.event.head_commit.url }})
-        run: |
-          APK_FILE=$(find app/build/outputs/apk/release -name "*universal.apk" -type f | head -n 1)
-          
-          if [ -z "$APK_FILE" ]; then
-            echo "未找到文件"
-            exit 1
-          fi
-          
-          # 转义 MarkdownV2 特殊字符
-          ESCAPED_MSG=$(echo "$COMMIT_MESSAGE" | sed 's/[!_*()\[\]\\]/\\&/g')
-          
-          # 发送到 Telegram
-          curl -v "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
-            -F "chat_id=${CHANNEL_ID}" \
-            -F "document=@${APK_FILE}" \
-            -F "caption=${ESCAPED_MSG}" \
-            -F "parse_mode=MarkdownV2"

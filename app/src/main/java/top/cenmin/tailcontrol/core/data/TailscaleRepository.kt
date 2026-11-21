@@ -24,14 +24,13 @@ class TailscaleRepository @Inject constructor(
 
     suspend fun fetchStatus(): TailscaleStatus {
         val result = shell.exec("tailscale status --json")
-        val raw = result.text
-        if (!result.ok && (raw.isBlank() || raw.contains("failed to") || raw.contains("connect"))) {
+        if (!result.ok) {
             return TailscaleStatus(
                 backendState = BackendState.DaemonOffline,
-                rawJson = raw,
+                rawJson = result.text,
             )
         }
-        return decodeStatus(raw)
+        return decodeStatus(result.out.joinToString("\n"))
     }
 
     fun decodeStatus(raw: String): TailscaleStatus {
@@ -110,7 +109,8 @@ class TailscaleRepository @Inject constructor(
         }.toList()
     }
 
-    suspend fun switchAccount(id: String): CommandResult = shell.exec("tailscale switch $id")
+    suspend fun switchAccount(id: String): CommandResult =
+        shell.exec(RootShell.argv("tailscale", "switch", "--", id))
 
     suspend fun logout(): CommandResult = shell.exec("tailscale logout")
 
@@ -122,27 +122,13 @@ class TailscaleRepository @Inject constructor(
      * 加 -c 30 限定最大 30 次，避免一直走 DERP 中继时无止境地刷。
      */
     fun ping(target: String): Flow<String> =
-        shell.stream("tailscale ping --timeout=2s -c 30 $target")
+        shell.stream(RootShell.argv("tailscale", "ping", "--timeout=2s", "-c", "30", "--", target))
 
     /** 实时 netcheck。 */
     fun netcheck(): Flow<String> = shell.stream("tailscale netcheck")
 
     suspend fun pidofTailscaled(): Int? =
         shell.execText("pidof tailscaled").trim().split(Regex("\\s+")).firstOrNull()?.toIntOrNull()
-
-    suspend fun killAllTailscale(): CommandResult = shell.exec("pkill -9 -x tailscale")
-
-    suspend fun pgrepTailscaleCount(): Int {
-        val out = shell.execText("pgrep -x tailscale")
-        return out.lineSequence().count { it.isNotBlank() }
-    }
-
-    /** 探测当前 tailscale 是否还支持 file 子命令（1.90+ 已删除）。 */
-    suspend fun isFileCommandSupported(): Boolean {
-        val r = shell.exec("tailscale file --help")
-        // 不存在时 stderr 含 "unknown subcommand: file"
-        return r.text.contains("unknown subcommand: file").not()
-    }
 
     suspend fun exitNodeSuggest(): String? {
         val text = shell.execText("tailscale exit-node suggest")
@@ -153,7 +139,7 @@ class TailscaleRepository @Inject constructor(
 
     suspend fun whois(ip: String): WhoisInfo? {
         if (ip.isBlank()) return null
-        val text = shell.execText("tailscale whois $ip")
+        val text = shell.execText(RootShell.argv("tailscale", "whois", "--", ip))
         if (text.isBlank() || text.contains("not found", ignoreCase = true)) return null
         // 解析两块: Machine / User
         val mName = Regex("Machine:\\s*\\n\\s*Name:\\s*(\\S+)").find(text)?.groupValues?.get(1)

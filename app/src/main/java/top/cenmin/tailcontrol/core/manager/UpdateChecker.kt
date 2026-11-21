@@ -25,7 +25,7 @@ class UpdateChecker @Inject constructor(
         isLenient = true
     }
 
-    private val GITHUB_API_URL = "https://api.github.com/repos/ArchChen1/Magisk-Tailscaled-GUI/releases/latest"
+    private val GITHUB_API_URL = "https://api.github.com/repos/gbthui/Magisk-Tailscaled-GUI/releases/latest"
 
     suspend fun checkUpdate(): Result<CheckUpdateResult> = withContext(Dispatchers.IO) {
         try {
@@ -44,6 +44,18 @@ class UpdateChecker @Inject constructor(
             }
 
             val responseCode = connection.responseCode
+
+            if (responseCode == HttpURLConnection.HTTP_NOT_FOUND) {
+                val currentVersion = BuildConfig.VERSION_NAME
+                val placeholder = UpdateInfo(
+                    tagName = "v$currentVersion",
+                    name = currentVersion,
+                    body = "",
+                    htmlUrl = "https://github.com/gbthui/Magisk-Tailscaled-GUI/releases",
+                    publishedAt = "",
+                )
+                return@withContext Result.success(CheckUpdateResult(false, placeholder, currentVersion))
+            }
 
             if (responseCode != HttpURLConnection.HTTP_OK) {
                 return@withContext Result.failure(Exception("HTTP $responseCode"))
@@ -66,7 +78,7 @@ class UpdateChecker @Inject constructor(
     fun openReleasesPage() {
         val intent = Intent(
             Intent.ACTION_VIEW,
-            "https://github.com/ArchChen1/Magisk-Tailscaled-GUI/releases/latest".toUri()
+            "https://github.com/gbthui/Magisk-Tailscaled-GUI/releases".toUri()
         )
         intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
         context.startActivity(intent)

@@ -32,9 +32,14 @@ android {
         vectorDrawables { useSupportLibrary = true }
     }
 
+    val releaseStoreFile = System.getenv("STORE_FILE")
+        ?.takeIf { it.isNotBlank() }
+        ?.let { file(it) }
+        ?.takeIf { it.exists() && it.length() > 0L }
+
     signingConfigs {
         create("release") {
-            storeFile = System.getenv("STORE_FILE")?.let { file(it) }
+            storeFile = releaseStoreFile
             storePassword = System.getenv("STORE_PASSWORD")
             keyAlias = System.getenv("KEY_ALIAS")
             keyPassword = System.getenv("KEY_PASSWORD")
@@ -63,7 +68,11 @@ android {
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            signingConfig = if (releaseStoreFile != null) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -113,13 +122,14 @@ kotlin {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.splashscreen)
 
     implementation(libs.androidx.lifecycle.vm.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
-    implementation(libs.androidx.lifecycle.service)
 
     implementation(libs.androidx.nav.compose)
 
@@ -145,7 +155,6 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
 
     implementation(libs.libsu.core)
-    implementation(libs.libsu.service)
 
     implementation(libs.timber)
 }

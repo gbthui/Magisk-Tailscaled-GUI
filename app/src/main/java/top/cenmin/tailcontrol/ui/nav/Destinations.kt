@@ -3,7 +3,6 @@ package top.cenmin.tailcontrol.ui.nav
 import androidx.annotation.StringRes
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Article
-import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.NetworkCheck
@@ -16,7 +15,6 @@ import top.cenmin.tailcontrol.R
 object Destinations {
 
     @Serializable data object Home
-    @Serializable data object Drop
     @Serializable data object Settings
     @Serializable data object Accounts
     @Serializable data object Netcheck
@@ -35,7 +33,6 @@ enum class TopLevelDestination(
     val showInBar: Boolean = true,
 ) {
     Home(Icons.Filled.Home, R.string.nav_home, true),
-    Drop(Icons.AutoMirrored.Filled.Send, R.string.nav_drop, true),
     Netcheck(Icons.Filled.NetworkCheck, R.string.nav_netcheck, true),
     Traffic(Icons.Filled.Analytics, R.string.nav_traffic, true),
     Settings(Icons.Filled.Settings, R.string.nav_settings, true),

@@ -8,7 +8,6 @@
 
     <!-- Navigation -->
     <string name="nav_home">Home</string>
-    <string name="nav_drop">Drop</string>
     <string name="nav_settings">Settings</string>
     <string name="nav_accounts">Accounts</string>
     <string name="nav_netcheck">Netcheck</string>
@@ -129,56 +128,10 @@
     <string name="project_description">A GUI For Magisk-Tailscaled</string>
     <string name="github_repo">GitHub Repository</string>
 
-    <!-- Drop -->
-    <string name="drop_label">Drop daemon</string>
-    <string name="drop_service_started">Drop daemon started</string>
-    <string name="drop_service_stopped">Drop daemon stopped</string>
-    <string name="drop_stop_due_to_tail">Tailscale not running; Drop daemon will not start.</string>
-    <string name="rename">Rename</string>
-    <string name="skip">Skip</string>
-    <string name="overwrite">Overwrite</string>
-    <string name="path_selected">Path selected</string>
-    <string name="select_file">Select</string>
-    <string name="select_path">Path</string>
-    <string name="current_path">Path</string>
-    <string name="conflict_behavior">Conflict behavior</string>
-    <string name="file_receiver_daemon">File receiver daemon</string>
-    <string name="share_file">Share file</string>
-    <string name="conflict_behavior_set_to">Conflict behavior set to</string>
-    <string name="ping_placeholder">IP / node name</string>
-    <string name="test">Test</string>
-    <string name="fix_duplicate_file">Fix duplicate processes</string>
-    <string name="oops">Oops</string>
-    <string name="no_tail_process">No Tailscale process is running.</string>
-    <string name="only_one_process">A small number of Tailscale processes are running. Kill all?</string>
-    <string name="multi_process">Multiple Tailscale processes detected. Kill all?</string>
-    <string name="kill_process">Kill all Tailscale processes</string>
-    <string name="tip">Tip: after changing path or rule, toggle the switch off/on to apply.</string>
-    <string name="daemon_output">Daemon output</string>
-    <string name="msg_file_get_success">file get started, PPID=%1$d, PID=%2$d</string>
-    <string name="msg_file_get_success_but_pid_failed">file get started, but real PID for PPID=%1$d not found.</string>
-    <string name="msg_file_get_unexpected">file get unexpected error: %1$s</string>
-    <string name="msg_stop_file_get">file get stopped, PID=%1$d</string>
-    <string name="msg_file_get_failed_no_ppid">Failed to start file get: no PPID returned</string>
-    <string name="Daemon_running">Daemon running</string>
-    <string name="offline_now">Offline</string>
-    <string name="dir_created">Directory created: %s</string>
-    <string name="dir_create_failed">Failed to create directory: %s</string>
-    <string name="dir_create_permission_denied">Permission denied, cannot create directory %1$s: %2$s</string>
-    <string name="dir_create_error">Error creating directory %1$s: %2$s</string>
-    <string name="drop_start_failed_dir_invalid">Start failed, invalid directory: %s</string>
-    <string name="drop_failed_dir_invalid">Drop protection start failed: invalid directory</string>
-
     <!-- File transfer -->
+    <string name="offline_now">Offline</string>
     <string name="transfer_status">Transfer: %1$s</string>
-    <string name="force_cancel_transfer">Force cancel</string>
-    <string name="force_cancel_warn">Cancelling now restarts the Tailscale service while the file is still transferring. If the next transfer fails, restart Tailscale on the receiving device.</string>
     <string name="transfer_canceled">Transfer cancelled</string>
-    <string name="drop_canceling">Cancelling</string>
-    <string name="cancel_please_wait">Cancelling, please wait…</string>
-    <string name="operation_complete">Done</string>
-    <string name="tailreboot">Transfer cancelled, Tailscale service restarted.</string>
-    <string name="force_cancel_title">Cancel transfer?</string>
     <string name="send">Send</string>
     <string name="tailscale_not_running">Tailscale service not detected. Start it now?</string>
     <string name="tailnet_unreachable">Cannot reach the Tailnet — check your network.</string>
@@ -266,9 +219,6 @@
     <string name="peer_ssh_hint">Run this command on a machine with the tailscale CLI to SSH into this node.</string>
 
     <string name="exit_node_suggest_use">Use suggested: %1$s</string>
-
-    <string name="drop_unavailable_title">Drop unavailable</string>
-    <string name="drop_unavailable_msg">The current tailscale binary (1.90+) no longer ships the `file` subcommand. The receiver daemon and shared-file flow need a tailscale build that still includes file get/cp.</string>
 
     <string name="advertise_ssh">Advertise as Tailscale SSH server</string>
     <string name="advertise_ssh_desc">Other tailnet nodes can ssh into this device — uses tailscaled\'s built-in SSH, no system sshd required.</string>

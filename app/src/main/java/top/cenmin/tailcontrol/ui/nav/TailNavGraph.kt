@@ -21,7 +21,6 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import top.cenmin.tailcontrol.ui.screen.accounts.AccountsScreen
-import top.cenmin.tailcontrol.ui.screen.drop.DropScreen
 import top.cenmin.tailcontrol.ui.screen.home.HomeScreen
 import top.cenmin.tailcontrol.ui.screen.log.LogScreen
 import top.cenmin.tailcontrol.ui.screen.netcheck.NetcheckScreen
@@ -107,7 +106,6 @@ fun TailNavGraph(navController: NavHostController = rememberNavController()) {
                     onOpenLogs = { navController.navigate(Destinations.Logs) },
                 )
             }
-            composable<Destinations.Drop> { DropScreen() }
             composable<Destinations.Settings> {
                 SettingsScreen(
                     onOpenAccounts = { navController.navigate(Destinations.Accounts) },
@@ -154,7 +152,6 @@ fun TailNavGraph(navController: NavHostController = rememberNavController()) {
 private fun NavHostController.navigateTopLevel(dest: TopLevelDestination) {
     val route = when (dest) {
         TopLevelDestination.Home     -> Destinations.Home
-        TopLevelDestination.Drop     -> Destinations.Drop
         TopLevelDestination.Settings -> Destinations.Settings
         TopLevelDestination.Accounts -> Destinations.Accounts
         TopLevelDestination.Netcheck -> Destinations.Netcheck
@@ -173,7 +170,6 @@ private fun NavHostController.navigateTopLevel(dest: TopLevelDestination) {
 
 private fun TopLevelDestination.routeKeyword(): String = when (this) {
     TopLevelDestination.Home     -> "Home"
-    TopLevelDestination.Drop     -> "Drop"
     TopLevelDestination.Settings -> "Settings"
     TopLevelDestination.Accounts -> "Accounts"
     TopLevelDestination.Netcheck -> "Netcheck"

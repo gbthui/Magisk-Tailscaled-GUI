@@ -47,13 +47,24 @@ fun FileShareScreen(
     val ui by viewModel.ui.collectAsStateWithLifecycle()
     LaunchedEffect(uri) { viewModel.bind(uri) }
     val progress by animateFloatAsState(
-        targetValue = ui.progressPercent / 100f,
+        targetValue = (ui.progressPercent.coerceIn(0, 100)) / 100f,
         animationSpec = tween(durationMillis = 300, easing = LinearOutSlowInEasing),
         label = "progress",
     )
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text(ui.fileName.ifBlank { stringResource(R.string.share_label) }) }) },
+        topBar = {
+            TopAppBar(
+                title = { Text(ui.fileName.ifBlank { stringResource(R.string.share_label) }) },
+                actions = {
+                    if (!ui.transferring) {
+                        TextButton(onClick = onClose) {
+                            Text(stringResource(R.string.close))
+                        }
+                    }
+                },
+            )
+        },
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize().padding(horizontal = 16.dp)) {
             Spacer(Modifier.height(8.dp))
@@ -68,14 +79,18 @@ fun FileShareScreen(
                         style = MaterialTheme.typography.titleMedium,
                     )
                     Spacer(Modifier.height(8.dp))
-                    LinearProgressIndicator(
-                        progress = { progress },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    if (ui.transferring && ui.progressPercent < 0) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    } else {
+                        LinearProgressIndicator(
+                            progress = { progress },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                     if (ui.transferring) {
                         Spacer(Modifier.height(8.dp))
-                        Button(onClick = viewModel::openCancelDialog) {
-                            Text(stringResource(R.string.force_cancel_transfer))
+                        Button(onClick = viewModel::cancelTransfer) {
+                            Text(stringResource(R.string.cancel))
                         }
                     }
                 }
@@ -127,41 +142,6 @@ fun FileShareScreen(
             title = { Text("Tailscale ${stringResource(R.string.offline_now)}") },
             text = { Text(stringResource(R.string.tailnet_unreachable)) },
             confirmButton = { TextButton(onClick = viewModel::dismissOffline) { Text(stringResource(R.string.done)) } },
-        )
-    }
-    if (ui.cancelDialogOpen) {
-        AlertDialog(
-            onDismissRequest = viewModel::dismissCancelDialog,
-            title = { Text(stringResource(R.string.force_cancel_title)) },
-            text = { Text(stringResource(R.string.force_cancel_warn)) },
-            confirmButton = {
-                TextButton(onClick = { viewModel.confirmCancel(onClose) }) {
-                    Text(stringResource(R.string.confirm))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = viewModel::dismissCancelDialog) { Text(stringResource(R.string.cancel)) }
-            },
-        )
-    }
-    if (ui.processingDialog) {
-        AlertDialog(
-            onDismissRequest = {},
-            title = { Text(stringResource(R.string.drop_canceling)) },
-            text = { Text(stringResource(R.string.cancel_please_wait)) },
-            confirmButton = {},
-        )
-    }
-    if (ui.doneDialog) {
-        AlertDialog(
-            onDismissRequest = { viewModel.dismissDoneDialog(); onClose() },
-            title = { Text(stringResource(R.string.operation_complete)) },
-            text = { Text(stringResource(R.string.tailreboot)) },
-            confirmButton = {
-                TextButton(onClick = { viewModel.dismissDoneDialog(); onClose() }) {
-                    Text(stringResource(R.string.done))
-                }
-            },
         )
     }
 }

@@ -322,7 +322,7 @@ fun SettingsScreen(
                             onClick = {
                                 val intent = android.content.Intent(
                                     android.content.Intent.ACTION_VIEW,
-                                    "https://github.com/ArchChen1/Magisk-Tailscaled-GUI".toUri()
+                                    "https://github.com/gbthui/Magisk-Tailscaled-GUI".toUri()
                                 )
                                 context.startActivity(intent)
                             }
